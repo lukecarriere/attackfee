@@ -1,6 +1,6 @@
 // Plugin Check treats "WordPress" in the Plugin Name header as a trademark.
 // The display name in docs/copy.md and the header have to match, and neither may contain that word.
-// Agents once put "WordPress" in the name twice (47cb86d in copy, ffb9c3d in the header).
+// tests/plugin-name.test.ts keeps a sample of a header and a display name that contain WordPress.
 
 export function nameUsesWordPress(name) {
   return typeof name === "string" && /\bWordPress\b/.test(name);

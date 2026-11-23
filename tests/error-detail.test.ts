@@ -1,5 +1,5 @@
 // A caller-supplied field name must not come back in a challenge shape error.
-// PHP interpolated it until 650c81a. The Node checker still concatenated the key.
+// tests/fixtures/history keeps a PHP interpolation and a Node concatenation that did.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -7,7 +7,6 @@ import { readFileSync } from "node:fs";
 import { assertChallengeShape } from "../packages/protocol/src/index.ts";
 import { AttackfeeError } from "../packages/protocol/src/errors.ts";
 
-const git = (spec: string) => execFileSync("git", ["show", spec], { encoding: "utf8" });
 const ECHO = [/unknown field\s*\$/, /"unknown field "\s*\+/];
 
 function echoesField(src: string) {
@@ -44,14 +43,14 @@ test("current Node and PHP sources do not interpolate the field name", () => {
   assert.equal(php.trim(), "ok");
 });
 
-test("650c81a parent: PHP echoed the field name", () => {
-  const src = git(`650c81a^:packages/server-php/src/${"To" + "ll"}.php`);
+test("a PHP sample echoed the field name", () => {
+  const src = readFileSync(new URL("./fixtures/history/echo-field.php.txt", import.meta.url), "utf8");
   assert.equal(echoesField(src), true);
   assert.match(src, /unknown field \$k/);
 });
 
-test("5cd9c85: Node still concatenated the field name", () => {
-  const src = git("5cd9c85:packages/protocol/src/challenge.ts");
+test("a Node sample concatenated the field name", () => {
+  const src = readFileSync(new URL("./fixtures/history/echo-field.ts.txt", import.meta.url), "utf8");
   assert.equal(echoesField(src), true);
   assert.match(src, /"unknown field " \+ k/);
 });

@@ -1,0 +1,8 @@
+export const PAGES = [
+  { file: "mission", nav: "Mission", description: "A small check for comments, forms and write APIs. Page views stay free." },
+];
+export const LEGAL_PAGES = [
+  { file: "privacy", nav: "Privacy", description: "What the Toll MCP server and example.com collect: very little, and nothing from the demo form." },
+  { file: "terms", nav: "Terms", description: "The software is provided as is. Fair use rules for the demo." },
+  { file: "support", nav: "Support", description: "Where to ask questions and report bugs." },
+];

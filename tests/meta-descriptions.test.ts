@@ -4,7 +4,6 @@
 // The former mission pages (and their "Inner page descriptions") are gone; the worker redirects them.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync, mkdtempSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -75,9 +74,9 @@ test("meta description: every built page has exactly one, none empty, each from 
   check(DIST, "website/dist");
 });
 
-test("5cd9c85: legal descriptions were inlined in the build, not in docs/copy.md", () => {
-  const copy = execFileSync("git", ["show", "5cd9c85:docs/copy.md"], { encoding: "utf8" });
-  const build = execFileSync("git", ["show", "5cd9c85:website/build.mjs"], { encoding: "utf8" });
+test("a sample build inlined legal descriptions that were not in its copy file", () => {
+  const copy = readFileSync(new URL("./fixtures/history/copy-without-legal.md.txt", import.meta.url), "utf8");
+  const build = readFileSync(new URL("./fixtures/history/legal-pages-build.mjs.txt", import.meta.url), "utf8");
   assert.equal(copy.includes("## Legal page descriptions"), false);
   assert.match(build, new RegExp("What the " + "To" + "ll MCP server and [a-z0-9.]+ collect"));
   const now = readFileSync(ROOT + "docs/copy.md", "utf8");

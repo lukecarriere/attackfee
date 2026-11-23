@@ -1,25 +1,19 @@
-// The guard fails on the commits that shipped the mistake, and it is quiet on this tree.
-// cashuA: #20 bbeb17c and #21 5ef8dbd are on main.
-// Conservation: #22's pre-squash commits are on cursor/edge-cashu-receive-8ea2. CI fetches that
-// branch (ci.yml) because a squash merge does not keep them on main.
+// The guard fails on the known-bad samples in tests/fixtures/cashu-guards/, and it is quiet on this tree.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { conservationHits, tokenHits, treeHits } from "../scripts/cashu-guards.ts";
-// The WordPress plugin folder at that commit had the previous name.
-const OLD = "to" + "ll";
 
-const git = (spec: string) => execFileSync("git", ["show", spec], { encoding: "utf8" });
+const sample = (name: string) => readFileSync(new URL("./fixtures/cashu-guards/" + name, import.meta.url), "utf8");
 
 test("this tree has no cashuB-only gate and abort() stays on an empty restore", () => {
   assert.deepEqual(treeHits(), []);
 });
 
-test("bbeb17c required cashuB on the redeem body and refused a cashuA header", () => {
-  const rail = git("bbeb17c:packages/settlement-ln/src/rail.ts");
-  const http = git("bbeb17c:packages/server-node/src/http.ts");
-  const codec = git("bbeb17c:packages/settlement-ln/src/cashu.ts");
+test("a redeem body that requires cashuB, and a header that refuses cashuA, are gates", () => {
+  const rail = sample("redeem-body.ts.txt");
+  const http = sample("cashu-header.ts.txt");
+  const codec = sample("presented-cashu.ts.txt");
   assert.ok(tokenHits("packages/settlement-ln/src/rail.ts", rail).some((h) => h.rule === "cashuB-only gate"));
   assert.ok(tokenHits("packages/server-node/src/http.ts", http).some((h) => h.rule === "cashuA is not a payment"));
   assert.ok(tokenHits("packages/settlement-ln/src/cashu.ts", codec).some((h) => h.rule === "cashuA is not a payment"));
@@ -28,11 +22,11 @@ test("bbeb17c required cashuB on the redeem body and refused a cashuA header", (
   assert.match(codec, /startsWith\("cashuA"\)\) return \{ kind: "a" \}/);
 });
 
-test("5ef8dbd refused cashuA again, in Node, PHP, and the payer", () => {
-  const http = git("5ef8dbd:packages/server-node/src/http.ts");
-  const php = git("5ef8dbd:packages/server-php/src/Settlement.php");
-  const gate = git(`5ef8dbd:packages/wp-${OLD}-gate/includes/gate.php`);
-  const payer = git("5ef8dbd:packages/agent/src/cashu-payer.ts");
+test("cashuA is refused in Node, PHP, and the payer", () => {
+  const http = sample("owner-cashu.ts.txt");
+  const php = sample("settlement.php.txt");
+  const gate = sample("presented-gate.php.txt");
+  const payer = sample("payer-load.ts.txt");
   assert.ok(tokenHits("packages/server-node/src/http.ts", http).length > 0);
   assert.ok(tokenHits("packages/server-php/src/Settlement.php", php).some((h) => h.rule === "cashuA is not a payment"));
   assert.ok(tokenHits("packages/wp-attackfee/includes/gate.php", gate).some((h) => h.rule === "cashuA is not a payment"));
@@ -41,8 +35,8 @@ test("5ef8dbd refused cashuA again, in Node, PHP, and the payer", () => {
   assert.match(gate, /\$p\['kind'\] === 'a'\) return \[400, \['error' => 'malformed'\]/);
 });
 
-test("b73440c aborted and lost outputs the mint still held", () => {
-  const src = git("b73440c:packages/settlement-ln/src/cashu-receive.ts");
+test("abort and lose run while the mint still holds the outputs", () => {
+  const src = sample("abort-on-bad.ts.txt");
   const hits = conservationHits(src);
   assert.ok(hits.some((h) => h.rule.includes("not gated")));
   assert.ok(hits.some((h) => h.rule.startsWith("lose()")));
@@ -79,8 +73,8 @@ test("a sweeper may abort after tryRestore is none and tryCheck is unspent", () 
   assert.deepEqual(conservationHits(src), []);
 });
 
-test("f626e44 aborted on a mint refusal instead of an empty restore", () => {
-  const src = git("f626e44:packages/settlement-ln/src/cashu-receive.ts");
+test("abort on a mint refusal is not an empty restore", () => {
+  const src = sample("abort-on-refused.ts.txt");
   const hits = conservationHits(src);
   assert.ok(hits.some((h) => h.rule.includes("empty restore")));
   assert.match(src, /if \(outcome\.kind === "refused" && state === "unspent"\)/);
@@ -91,12 +85,12 @@ test("the current receive file gates the one abort() on an empty restore", () =>
   assert.deepEqual(conservationHits(src), []);
 });
 
-test("5ef8dbd PHP hits are on the call, not an earlier line", () => {
-  const php = git("5ef8dbd:packages/server-php/src/Settlement.php");
-  const gate = git(`5ef8dbd:packages/wp-${OLD}-gate/includes/gate.php`);
+test("PHP hits are on the call, not an earlier line", () => {
+  const php = sample("settlement.php.txt");
+  const gate = sample("presented-gate.php.txt");
   const lines = tokenHits("packages/server-php/src/Settlement.php", php).map((h) => h.line).sort((a, b) => a - b);
   assert.deepEqual(lines, [99, 100, 161]);
-  assert.deepEqual(tokenHits("packages/wp-attackfee/includes/gate.php", gate).map((h) => h.line), [177]);
+  assert.deepEqual(tokenHits("packages/wp-attackfee/includes/gate.php", gate).map((h) => h.line), [9]);
 });
 
 test("call, switch, element access, match, apply, and strpos still refuse cashuA or abort", () => {
