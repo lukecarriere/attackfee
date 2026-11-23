@@ -1,0 +1,27 @@
+{
+  "name": "@attackfee/agent",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/lukecarriere/attackfee.git", "directory": "packages/agent" },
+  "homepage": "https://attackfee.dev/docs",
+  "bugs": { "url": "https://github.com/lukecarriere/attackfee/issues" },
+  "type": "module",
+  "description": "Client for automated callers. Does the work for a write on an Attackfee site, or pays per write, and retries once.",
+  "keywords": ["ai-agents", "http-402", "proof-of-work", "attackfee"],
+  "engines": { "node": ">=22.18" },
+  "exports": {
+    ".": {
+      "types": "./dist/types/agent/src/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/types/agent/src/index.d.ts",
+  "bin": { "attackfee-agent-pay": "./dist/agent-pay.js" },
+  "files": ["dist", "README.md", "LICENSE"],
+  "publishConfig": { "access": "public", "provenance": true },
+  "dependencies": {
+    "@noble/curves": "2.4.0",
+    "altcha-lib": "2.5.0",
+    "hash-wasm": "4.12.0"
+  }
+}

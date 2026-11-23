@@ -1,0 +1,20 @@
+/* Guides and the download page. Adds what those pages need on top of site.css. */
+nav.guides{flex-basis:100%;font-size:14px;opacity:.9}
+main h2{font:700 28px/1.2 "Attackfee Sans",system-ui,sans-serif;letter-spacing:-.02em;color:var(--af-ink);margin:36px 0 12px}
+main h3{font:600 21px/1.3 "Attackfee Sans",system-ui,sans-serif;margin:28px 0 8px}
+main a{color:var(--af-signal-deep)}
+pre{margin:0 0 20px;padding:14px 16px;max-width:100%;min-width:0;overflow-x:auto;background:var(--af-graphite);color:var(--af-hail);border-radius:4px}
+pre[tabindex]:focus-visible{outline:2px solid var(--af-signal);outline-offset:2px}
+pre code{font:13px/1.55 "Attackfee Mono",ui-monospace,monospace}
+p code,li code,td code{font:.88em "Attackfee Mono",ui-monospace,monospace;background:#E7EBEE;padding:0 .25em;border-radius:3px;overflow-wrap:anywhere}
+@media (max-width:480px){
+ main h2{font-size:24px}
+ pre{padding:12px}
+}
+main li a{display:inline-flex;align-items:center;min-height:24px;min-width:24px;padding:4px 0}
+table{width:100%;table-layout:fixed;border-collapse:collapse;margin:0 0 20px}
+th,td{text-align:left;vertical-align:top;padding:8px 10px;border-bottom:1px solid var(--af-rule);overflow-wrap:anywhere}
+th{font-weight:600}
+
+.cta{display:inline-flex;align-items:center;min-height:24px;background:var(--af-ink);color:var(--af-hail);font-weight:600;padding:.55rem 1.1rem;border-radius:4px;text-decoration:none}
+main a.cta,.cta:hover{color:var(--af-hail)}

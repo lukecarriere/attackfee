@@ -1,0 +1,45 @@
+/* Demo page only, on top of site.css. */
+main{max-width:980px}
+.bar{max-width:980px}
+.site-foot nav,.site-foot p{max-width:980px}
+.brand{display:inline-flex;align-items:flex-end;gap:12px}
+.tag{font:400 13px/1 "Attackfee Mono",ui-monospace,monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--af-signal);padding-bottom:3px}
+.demo{display:grid;grid-template-columns:minmax(0,1fr) 260px;gap:28px;align-items:start}
+.demo>*{min-width:0}
+.demo>.card{grid-column:1}
+.demo>.stats{grid-column:2;grid-row:1 / span 2}
+.card{margin:0 0 28px}
+h2{font:700 26px/1.2 "Attackfee Sans",system-ui,sans-serif;letter-spacing:-.02em;color:var(--af-ink);margin:28px 0 8px}
+.sub{color:var(--af-steel);font-size:16px}
+label{display:block;font-size:15px;color:var(--af-steel);margin:12px 0 4px}
+input,textarea{width:100%;min-width:0;max-width:100%;font:inherit;color:inherit;background:#fff;border:1px solid var(--af-rule);border-radius:4px;padding:10px 12px}
+input:focus-visible,textarea:focus-visible{outline:2px solid var(--af-signal-deep);outline-offset:1px}
+textarea{min-height:96px;resize:vertical}
+.row2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
+.row2>*{min-width:0}
+button.b{font:inherit;font-weight:600;background:var(--af-ink);color:var(--af-hail);border:1px solid var(--af-ink);border-radius:4px;padding:10px 18px;margin-top:14px;cursor:pointer}
+button.sec{background:transparent;color:var(--af-ink)}
+button.b:focus-visible{outline:2px solid var(--af-signal-deep);outline-offset:2px}
+.pill{display:inline-block;margin-top:12px;padding:4px 10px;border-radius:999px;font:400 14px/1.4 "Attackfee Mono",ui-monospace,monospace}
+.pill.ok{background:#E1ECF3;color:var(--af-read)}
+.pill.bad{background:#FBE7E0;color:var(--af-signal-deep)}
+pre{background:var(--af-ink);color:var(--af-hail);padding:14px 16px;border-radius:4px;overflow:auto;max-width:100%;min-width:0;font:13px/1.55 "Attackfee Mono",ui-monospace,monospace}
+pre[tabindex]:focus-visible{outline:2px solid var(--af-signal);outline-offset:2px}
+pre .g{color:var(--af-hail);opacity:.7}
+pre .r{color:var(--af-signal)}
+.stats .card{background:var(--af-ink);color:var(--af-hail);padding:4px 18px 16px;border-radius:4px}
+.stats h2{color:#fff;font-size:20px;margin-top:14px}
+.kv{display:grid;grid-template-columns:1fr auto;gap:8px 16px;margin:8px 0 0}
+.kv dd{margin:0;font-family:"Attackfee Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums}
+.note{font-size:14px;margin:14px 0 0}
+.stats code{background:var(--af-graphite);color:var(--af-hail);font:.9em "Attackfee Mono",ui-monospace,monospace;padding:0 .25em;border-radius:3px;overflow-wrap:anywhere}
+.fine{font-size:15px;color:var(--af-steel)}
+.local code{font:.88em "Attackfee Mono",ui-monospace,monospace;background:#E7EBEE;padding:0 .25em;border-radius:3px;overflow-wrap:anywhere}
+.local ol{max-width:40em;padding-left:1.25rem}
+.local li{margin:0 0 10px}
+@media (max-width:760px){
+ /* 1fr is minmax(auto, 1fr): the curl line's min-content made the page 423px on a 390px phone. */
+ .demo{grid-template-columns:minmax(0,1fr)}
+ .demo>.stats{grid-column:1;grid-row:auto}
+ .row2{grid-template-columns:minmax(0,1fr)}
+}

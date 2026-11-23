@@ -1,0 +1,273 @@
+// attackfee.yaml loader (spec §14). Values of the form "env:NAME" are read from the environment.
+import { readFileSync } from "node:fs";
+import { parse } from "yaml";
+import { type ActionClass, type WorkPolicy, type ProxyRange, DEFAULT_ESCALATE, isActionClass, siteUrl, trustedProxies } from "../../protocol/src/index.ts";
+import { assertProductionMint } from "../../settlement-ln/src/cashu-net.ts";
+
+/**
+ * One route rule. A rule's class applies to writes (POST, PUT, PATCH, DELETE) under the prefix.
+ * Page loads (GET, HEAD, OPTIONS) are always `read` (Amendment 2 §A) unless `get: true` is set on a
+ * rule above read, which needs `confirm_page_view_gating: true`. `cost: 0` makes the rule free
+ * (search may be set to 0 by the owner). `{ prefix: "/", class: read }` is the explicit page-view
+ * rule: it keeps every page load free and does not change the default for unmapped writes (write).
+ */
+export interface RouteRule { prefix: string; class: ActionClass; cost?: 0; get?: boolean }
+
+/** Amendment 2 §A, exact (docs/copy.md): shown before page views can be gated. */
+export const PAGE_VIEW_WARNING = "This hides the site from answer engines and new readers. Attackfee is for writes.";
+/** Routes editor confirm (docs/copy.md, Amendment 2): body is PAGE_VIEW_WARNING; `keep` is the focused default, `gate` is destructive. */
+export const PAGE_VIEW_CONFIRM = { keep: "Keep pages open", gate: "Gate page views" } as const;
+
+export interface AttackfeeConfig {
+  site_id: string;
+  secret: string;
+  issuer_public_url: string;
+  hostname: string;
+  allowed_origins: string[];
+  defaults: {
+    pass_ttl_s: number;
+    pass_uses: number;
+    challenge_ttl_s: number;
+    max_solve_ms: number;
+  };
+  work: WorkPolicy;
+  adaptive: { velocity: boolean };
+  rate_limit: { challenge_per_min: number };
+  cookie: { secure: "auto" | boolean };
+  routes: RouteRule[];
+  /** The owner confirmed the page-view warning (PAGE_VIEW_WARNING) so a GET route may be gated. */
+  confirm_page_view_gating: boolean;
+  /**
+   * Agent discovery (Amendment 3): the `docs` URL in /.well-known/attackfee.json. `discovery.docs_url` in the
+   * config wins; otherwise the ATTACKFEE_SITE_URL environment variable (packages/protocol site-url.ts); null
+   * when neither is set.
+   */
+  discovery: { docs_url: string | null };
+  /**
+   * Reverse proxies whose X-Forwarded-For is read (packages/protocol client-ip.ts, docs/adapters.md):
+   * from the ATTACKFEE_TRUSTED_PROXIES environment variable, comma-separated addresses and CIDR ranges.
+   * Empty (the default): the socket address is the client and X-Forwarded-For is never read.
+   */
+  trusted_proxies: ProxyRange[];
+  settlement: SettlementConfig;
+}
+
+/**
+ * Paid requests (spec §8.6, docs/settlement.md). Phase 2 ships only the "stub" backend: a local
+ * test settler with no network and no real funds. The rate is used for USD display only.
+ */
+export interface SettlementConfig {
+  enabled: boolean;
+  backend: "stub";
+  /** Platform fee in basis points, rounded down per payment and held until phase 4 (Q5). */
+  fee_bps: number;
+  /** Uses per settle pass (Q6: 1). */
+  pass_uses: number;
+  /** Settle pass lifetime in seconds (Q6: at most 60). */
+  pass_ttl_s: number;
+  /** Offer lifetime in seconds (at most 120). */
+  offer_ttl_s: number;
+  /** USD display rate. "public" is a live keyless market feed; "fixed" is a test value, not a market price; "none" hides USD. */
+  fx: { source: "fixed" | "none" | "public"; usd_per_btc?: number };
+  /**
+   * Bearer key for the owner API (GET /v1/owner/balance, POST /v1/owner/withdraw) that a
+   * WordPress site with "Payment server" uses for its balance and withdrawals. Unset: owner API off.
+   */
+  owner_key?: string;
+  /**
+   * Ecash option. Two shapes, never both:
+   * `mint` is the loopback test mint (http, no path).
+   * `mints` is the production allowlist of https mint URLs. Empty means that path is off.
+   * `store` is the proof file, required when `mints` is non-empty.
+   * Refused when the settlement backend is not the stub, or when mode is live.
+   */
+  cashu?: { enabled: true; mint: string } | { enabled: true; mints: string[]; store: string };
+}
+
+// Policy defaults. Calibration and the measured runs behind them: docs/policy.md.
+export const DEFAULT_WORK: WorkPolicy = {
+  mode: "standard",
+  // Engine tries per 1x unit. Calibrated on the box (docs/policy.md); write = 4 units.
+  standard: { alg: "pbkdf2-sha256", cost: 5000, unit_tries: 64 },
+  hardened: { alg: "argon2id", cost: 2, memory_kib: 19456, parallelism: 1, unit_tries: 4 },
+  max_units: 28,
+  device_mult: { mobile: 0.6, desktop: 1.0 },
+  velocity_steps: [[20, 2], [40, 4], [80, 8], [160, 16]],
+  velocity_window_s: 60,
+};
+
+function resolveEnv(v: unknown, env: NodeJS.ProcessEnv): unknown {
+  if (typeof v === "string" && v.startsWith("env:")) return env[v.slice(4)];
+  return v;
+}
+
+export function normalizeConfig(raw: Record<string, any>, env: NodeJS.ProcessEnv = process.env): AttackfeeConfig {
+  const site_id = String(raw.site_id ?? "");
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(site_id)) throw new Error("attackfee config: site_id is required (letters, digits, _ and -)");
+  const secret = resolveEnv(raw.secret, env);
+  if (typeof secret !== "string" || secret.length < 16) throw new Error("attackfee config: secret is missing or shorter than 16 characters");
+  const issuer_public_url = String(raw.issuer_public_url ?? "http://localhost:8787");
+  const d = raw.defaults ?? {};
+  if (d.algos !== undefined) throw new Error("attackfee config: defaults.algos was replaced by work.mode (standard | hardened); see docs/adapters.md");
+  const challenge_ttl_s = Number(d.challenge_ttl_s ?? 120);
+  if (!(challenge_ttl_s > 0 && challenge_ttl_s <= 120)) throw new Error("attackfee config: challenge_ttl_s must be 1..120");
+  const confirm_page_view_gating = raw.confirm_page_view_gating === true;
+  const routes: RouteRule[] = (raw.routes ?? []).map((r: any) => {
+    if (typeof r?.prefix !== "string" || !r.prefix.startsWith("/") || !isActionClass(r.class)) throw new Error("attackfee config: bad route " + JSON.stringify(r));
+    if (r.cost !== undefined && r.cost !== 0) throw new Error(`attackfee config: route ${r.prefix}: cost can only be 0 (free); leave it out for the class default`);
+    if (r.get !== undefined && typeof r.get !== "boolean") throw new Error(`attackfee config: route ${r.prefix}: get must be true or false`);
+    const out: RouteRule = { prefix: r.prefix, class: r.class };
+    if (r.cost === 0) out.cost = 0;
+    if (r.get === true) out.get = true;
+    // Gating page views (the "/" rule above read, or any rule that also gates GET) needs an explicit confirm.
+    const gatesPages = out.class !== "read" && out.cost !== 0 && (out.prefix === "/" || out.get === true);
+    if (gatesPages && !confirm_page_view_gating) throw new Error(`attackfee config: route ${out.prefix} would gate page views. ${PAGE_VIEW_WARNING} To do it anyway, set confirm_page_view_gating: true.`);
+    if (out.prefix === "/" && out.class !== "read") out.get = true;
+    return out;
+  });
+  const w = raw.work ?? {};
+  for (const k of ["cost", "n", "bits", "unit_iterations", "max_iterations"]) if (k in w) throw new Error(`attackfee config: work.${k} belongs to the retired built-in miner; use work.mode and work.standard / work.hardened (docs/policy.md)`);
+  const work: WorkPolicy = {
+    ...DEFAULT_WORK,
+    ...w,
+    standard: { ...DEFAULT_WORK.standard, ...(w.standard ?? {}), alg: "pbkdf2-sha256" },
+    hardened: { ...DEFAULT_WORK.hardened, ...(w.hardened ?? {}), alg: "argon2id" },
+    device_mult: { ...DEFAULT_WORK.device_mult, ...(w.device_mult ?? {}) },
+    escalate: { ...DEFAULT_ESCALATE, ...(w.escalate ?? {}) },
+  };
+  if (!(work.escalate!.at_velocity >= 1) || !Array.isArray(work.escalate!.classes) || !work.escalate!.classes.every((c) => isActionClass(c) && c !== "read")) throw new Error("attackfee config: work.escalate needs at_velocity >= 1 and classes from search, write, account, admin");
+  if (work.mode !== "standard" && work.mode !== "hardened") throw new Error("attackfee config: work.mode must be standard or hardened");
+  for (const m of [work.standard, work.hardened]) {
+    if (!(Number.isInteger(m.cost) && m.cost >= 1)) throw new Error("attackfee config: work cost must be a positive integer");
+    if (!(m.unit_tries > 0)) throw new Error("attackfee config: work unit_tries must be positive");
+  }
+  if (!(Number.isInteger(work.hardened.memory_kib) && work.hardened.memory_kib! >= 8192 && work.hardened.memory_kib! <= 262144)) throw new Error("attackfee config: work.hardened.memory_kib must be 8192..262144");
+  const settlement = normalizeSettlement(raw.settlement ?? {}, env);
+  return {
+    site_id,
+    secret,
+    issuer_public_url,
+    hostname: String(raw.hostname ?? new URL(issuer_public_url).hostname),
+    allowed_origins: (raw.allowed_origins ?? [new URL(issuer_public_url).origin]).map(String),
+    defaults: {
+      pass_ttl_s: Number(d.pass_ttl_s ?? 900),
+      pass_uses: Number(d.pass_uses ?? 20),
+      challenge_ttl_s,
+      max_solve_ms: Number(d.max_solve_ms ?? 8000),
+    },
+    work,
+    adaptive: { velocity: Boolean(raw.adaptive?.velocity ?? false) },
+    rate_limit: { challenge_per_min: Number(raw.rate_limit?.challenge_per_min ?? 60) },
+    cookie: { secure: raw.cookie?.secure ?? "auto" },
+    routes,
+    confirm_page_view_gating,
+    discovery: { docs_url: typeof raw.discovery?.docs_url === "string" && /^https?:\/\//.test(raw.discovery.docs_url) ? raw.discovery.docs_url : siteUrl(env.ATTACKFEE_SITE_URL) },
+    trusted_proxies: trustedProxies(env.ATTACKFEE_TRUSTED_PROXIES),
+    settlement,
+  };
+}
+
+function cashuAsked(raw: unknown): boolean {
+  if (raw === true) return true;
+  return !!raw && typeof raw === "object" && (raw as { enabled?: unknown }).enabled === true;
+}
+
+/** Loopback http origin, no path, no userinfo. Refuses any other mint so this build cannot point at a real one. */
+function mintError(why: string): never {
+  throw new Error("attackfee config: settlement.cashu.mint " + why);
+}
+
+function parseMintUrl(mintUrl: string): URL {
+  try { return new URL(mintUrl); } catch { return mintError("must be a loopback http URL"); }
+}
+
+function loopbackMint(raw: unknown): string {
+  if (typeof raw !== "string") mintError("must be a loopback http URL");
+  const mintUrl = raw.trim();
+  if (mintUrl === "") mintError("must be a loopback http URL");
+  const u = parseMintUrl(mintUrl);
+  if (u.protocol !== "http:") mintError("must be http");
+  if (u.username !== "" || u.password !== "" || u.search !== "" || u.hash !== "") mintError("must be a loopback http URL");
+  // A path is a different refusal from a non-loopback host, so a test can lock each rule on its own.
+  if (u.pathname !== "/" && u.pathname !== "") mintError("must not include a path");
+  const host = u.hostname;
+  const loop = host === "127.0.0.1" || host === "localhost" || host === "::1";
+  if (!loop) mintError("host must be loopback");
+  return u.origin;
+}
+
+function normalizeSettlement(s: Record<string, any>, env: NodeJS.ProcessEnv): SettlementConfig {
+  const enabled = Boolean(s.enabled ?? false);
+  const backend = String(s.backend ?? "stub");
+  const mode = s.mode === undefined || s.mode === null ? "test" : String(s.mode);
+  let cashu: SettlementConfig["cashu"];
+  if (cashuAsked(s.cashu)) {
+    // The stub backend with no live mode flag. Anything else refuses, before the generic
+    // backend check, so the error names this option. Live mode still throws.
+    const testMode = backend === "stub" && (mode === "test" || mode === "stub");
+    if (!testMode) throw new Error("attackfee config: the Cashu option is only available in test mode");
+    if (!enabled) throw new Error("attackfee config: the Cashu option requires settlement.enabled in test mode");
+    const raw = s.cashu === true || s.cashu == null ? {} : s.cashu;
+    const listed = Array.isArray(raw.mints) ? raw.mints as unknown[] : undefined;
+    const hasTestMint = typeof raw.mint === "string" && raw.mint.trim() !== "";
+    if (listed && listed.length > 0 && hasTestMint) throw new Error("attackfee config: settlement.cashu.mint and settlement.cashu.mints are separate");
+    if (listed && listed.length > 0) {
+      const mints = listed.map((entry) => {
+        if (typeof entry !== "string") throw new Error("attackfee config: settlement.cashu.mints must be https URLs");
+        try { return assertProductionMint(entry); } catch (e) { throw new Error("attackfee config: settlement.cashu.mints " + (e instanceof Error ? e.message : "rejected")); }
+      });
+      const storeRaw = resolveEnv(raw.store, env);
+      if (typeof storeRaw !== "string" || storeRaw.trim() === "" || storeRaw.includes("://")) throw new Error("attackfee config: settlement.cashu.store is required");
+      cashu = { enabled: true, mints, store: storeRaw.trim() };
+    } else if (!(listed && listed.length === 0 && !hasTestMint)) {
+      const mint = loopbackMint(s.cashu === true ? undefined : s.cashu.mint);
+      cashu = { enabled: true, mint };
+    }
+  }
+  if (enabled && backend !== "stub") throw new Error(`attackfee config: settlement.backend "${backend}" is not available in this build (only "stub", the local test backend)`);
+  const fee_bps = Number(s.fee_bps ?? 1000);
+  if (!(Number.isInteger(fee_bps) && fee_bps >= 0 && fee_bps <= 10000)) throw new Error("attackfee config: settlement.fee_bps must be an integer 0..10000");
+  // Phase 3 (spec §18): the settle pass is single-use. Spec §8.6.4 allows "n = 1 or exp <= 60 s";
+  // Attackfee does both, so pass_uses is fixed at 1 and pass_ttl_s is 1..60.
+  const pass_uses = Number(s.pass_uses ?? 1);
+  if (pass_uses !== 1) throw new Error("attackfee config: settlement.pass_uses must be 1 (a paid pass is single-use)");
+  const pass_ttl_s = Number(s.pass_ttl_s ?? 60);
+  if (!(Number.isInteger(pass_ttl_s) && pass_ttl_s >= 1 && pass_ttl_s <= 60)) throw new Error("attackfee config: settlement.pass_ttl_s must be 1..60");
+  const offer_ttl_s = Number(s.offer_ttl_s ?? 120);
+  if (!(Number.isInteger(offer_ttl_s) && offer_ttl_s >= 10 && offer_ttl_s <= 120)) throw new Error("attackfee config: settlement.offer_ttl_s must be 10..120");
+  const fxRaw = s.fx ?? {};
+  const source = String(fxRaw.source ?? "public");
+  if (source !== "fixed" && source !== "none" && source !== "public") throw new Error(`attackfee config: settlement.fx.source "${source}" is not available in this build (fixed | none | public)`);
+  let usd_per_btc: number | undefined;
+  if (source === "fixed") {
+    usd_per_btc = Number(fxRaw.usd_per_btc);
+    if (!(usd_per_btc > 0 && Number.isFinite(usd_per_btc))) throw new Error("attackfee config: settlement.fx.usd_per_btc must be a positive number when source is fixed");
+  }
+  const ok = resolveEnv(s.owner_key, env);
+  if (ok !== undefined && ok !== null && (typeof ok !== "string" || ok.length < 16)) throw new Error("attackfee config: settlement.owner_key must be at least 16 characters (or env:NAME)");
+  const owner_key = typeof ok === "string" ? ok : undefined;
+  return { enabled, backend: "stub", fee_bps, pass_uses, pass_ttl_s, offer_ttl_s, fx: { source, usd_per_btc }, ...(owner_key ? { owner_key } : {}), ...(cashu ? { cashu } : {}) };
+}
+
+export function loadConfig(path: string, env: NodeJS.ProcessEnv = process.env): AttackfeeConfig {
+  return normalizeConfig(parse(readFileSync(path, "utf8")) ?? {}, env);
+}
+
+/**
+ * Longest matching route prefix wins. Page loads (GET, HEAD, OPTIONS) are `read` unless the rule
+ * that matches them sets `get: true` (only allowed with confirm_page_view_gating). Unmapped writes
+ * are `write` (spec §8.4); the explicit `/` read rule keeps that default. `cost: 0` is `read`.
+ */
+export function classifyPath(routes: RouteRule[], path: string, method: string): { cls: ActionClass; prefix: string } {
+  const m = method.toUpperCase();
+  const page = m === "GET" || m === "HEAD" || m === "OPTIONS";
+  let best: RouteRule | undefined;
+  for (const r of routes) {
+    if (!path.startsWith(r.prefix) || (best && r.prefix.length <= best.prefix.length)) continue;
+    if (!page && r.prefix === "/" && r.class === "read") continue; // the page-view rule says nothing about writes
+    best = r;
+  }
+  if (page) return { cls: best?.get === true && best.cost !== 0 ? best.class : "read", prefix: best?.prefix ?? "/" };
+  if (best) return { cls: best.cost === 0 ? "read" : best.class, prefix: best.prefix };
+  return { cls: "write", prefix: "/" };
+}

@@ -1,0 +1,3 @@
+{ "name": "@attackfee/protocol", "private": true, "version": "0.1.0", "license": "MIT", "type": "module",
+  "description": "Attackfee wire protocol v1: challenges, work, passes.",
+  "exports": { ".": "./src/index.ts", "./site-url": "./src/site-url.ts" } }

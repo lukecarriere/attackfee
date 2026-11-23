@@ -1,0 +1,83 @@
+<?php
+// Every owner- and visitor-facing string, word for word from docs/copy.md (WordPress strings) and
+// design/proto/wp-settings.html. The copy lint scans this folder.
+declare(strict_types=1);
+
+if (!defined('ABSPATH')) exit;
+
+function attackfee_wp_s(string $k): string
+{
+    static $s = [
+        'menu' => 'Attackfee',
+        'title' => 'Attackfee',
+        // Amendment 2 §C, first screen after install (docs/copy.md, exact).
+        'install_line' => 'Attackfee checks writes, not page views. Leave public pages open so people and answer engines can read you. Turn Attackfee on for comments, forms, logins, and APIs.',
+        'issued_today' => 'Challenges issued today: %s',
+        'export' => 'Export counters',
+        'export_help' => 'Downloads the counts as a CSV file. Nothing is sent anywhere.',
+        'protect_h' => 'Protect these forms',
+        'protect_desc' => 'Visitors get an invisible check. Forms that skip it are rejected.',
+        'forms' => 'Forms',
+        'comments' => 'Comments',
+        'login' => 'Login',
+        'register' => 'Registration',
+        'lostpassword' => 'Lost password',
+        'woo' => 'WooCommerce checkout',
+        'woo_active' => '(WooCommerce is active)',
+        // PM, Oct 2, 2026 (docs/copy.md "WordPress strings", exact): the block checkout is off at launch.
+        'woo_help' => "Covers the classic checkout. The newer block checkout isn't covered yet.",
+        'cf7' => 'Contact Form 7 forms',
+        'cf7_active' => '(Contact Form 7 is active)',
+        'any_form' => 'Any form with <code>data-attackfee</code>',
+        'any_form_help' => 'Always on. Add <code>data-attackfee="write"</code> to a form in your theme to protect it.',
+        'visible_h' => 'Visible check',
+        'visible_label' => 'Show a “Verify before sending” button instead of an invisible check',
+        'visible_help' => "Off by default. Most sites don't need it.",
+        'longest_h' => 'Longest check',
+        'seconds' => '%d seconds',
+        'longest_help' => 'If a check would take longer, the visitor gets a “Verify before sending” button instead of waiting.',
+        'keys_h' => 'Keys',
+        'site_key' => 'Site key',
+        'site_key_help' => 'Created when you installed the plugin.',
+        'secret' => 'Secret',
+        'show' => 'Show',
+        'hide' => 'Hide',
+        'new_secret' => 'Generate new secret',
+        'secret_help' => 'Checks run on this site. Keep the secret private; after generating a new one, visitors get a fresh check on their next form.',
+        'payouts_h' => 'Usage payouts',
+        'payouts' => 'Payouts',
+        'collect' => 'Collect usage payouts',
+        'collect_help' => 'High-volume clients can pay per request. You withdraw from the dashboard.',
+        'balance' => 'Balance',
+        'balance_line' => 'available to withdraw, after the {fee}% platform fee',
+        'balance_later' => 'Balance will show again shortly',
+        'to_withdraw' => 'To withdraw, open Advanced settlement below.',
+        'no_addr' => 'Payouts start once a payment server address is added.',
+        'adv' => 'Advanced settlement',
+        'adv_note' => 'Payment connection, fee and withdrawals',
+        'connection' => 'Payment connection',
+        'conn_test' => 'Test mode (no real money)',
+        'conn_server' => 'Payment server',
+        'test_help' => 'In test mode, no real money moves and clients do the background check instead of paying. To try payouts, choose Payment server and add the address of a server running in test mode.',
+        'server_addr' => 'Payment server address',
+        'server_addr_ph' => 'https://pay.example.com',
+        'server_addr_help' => 'Payouts need a server that can take payments. Paste its address here. Protection keeps working on this site without it.',
+        'server_key' => 'Payment server key',
+        'server_key_help' => "Stored on this server only. Never sent to visitors' browsers.",
+        'fee_h' => 'Platform fee',
+        'fee_line' => '{fee}%',
+        'fee_note' => '· recorded on each payment',
+        'withdraw' => 'Withdraw',
+        'withdraw_ph' => 'Paste a payout invoice for up to %s',
+        'withdraw_help' => 'The invoice amount is checked against your balance before anything is sent.',
+        'save' => 'Save Changes',
+        'n_saved' => 'Settings saved.',
+        'n_withdrawn' => 'Withdrawal sent: %s.',
+        'n_wd_failed' => "That invoice couldn't be paid. Check the amount and try again.",
+        'n_wd_too_much' => 'That invoice is for more than your available balance.',
+        'n_paused' => 'Paid requests are paused. Visitors and clients can still get through with the background check.',
+        'n_down' => "The payment server isn't responding. Visitors and clients can still get through with the background check.",
+        'no_js' => 'This form needs JavaScript.',
+    ];
+    return $s[$k];
+}

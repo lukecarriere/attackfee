@@ -1,0 +1,186 @@
+<?php
+// Usage payouts (option A, docs/copy.md): WordPress takes no payments itself. Test mode is
+// work-only (no balance, no withdrawals, agents do the background check); Payment server reads the
+// balance from, and sends withdrawals to, an Attackfee issuer the owner runs (owner API:
+// GET /v1/owner/balance, POST /v1/owner/withdraw, docs/settlement.md §9). Nothing here runs unless
+// the owner ticks "Collect usage payouts", and no request leaves this site in test mode.
+declare(strict_types=1);
+
+if (!defined('ABSPATH')) exit;
+
+
+// Platform fee shown until a payment server reports its own.
+const ATTACKFEE_WP_TEST_FEE_BPS = 1000;
+const ATTACKFEE_WP_SERVER_TIMEOUT_S = 3;
+// Agents wait at most this long for offers before they get the work check instead.
+const ATTACKFEE_WP_OFFER_TIMEOUT_S = 1.5;
+// After the payment server fails to answer, agents skip it (work check only) for this long.
+const ATTACKFEE_WP_DOWN_CACHE_S = 30;
+
+/**
+ * Current payouts view for the settings page.
+ * state: 'off' | 'test' | 'noaddr' | 'down' | 'ok'. 'test' (work-only) shows like 'noaddr': no balance.
+ * usd: available balance string or null (hide the amount); fee_bps; paused (payments paused).
+ */
+function attackfee_wp_payouts_view(?array $s = null): array
+{
+    $s ??= attackfee_wp_settings();
+    $base = ['state' => 'off', 'usd' => null, 'fee_bps' => ATTACKFEE_WP_TEST_FEE_BPS, 'paused' => false, 'available_msat' => null];
+    if (!$s['payouts']) return $base;
+    if ($s['connection'] !== 'server') return ['state' => 'test'] + $base;
+    if (trim((string) $s['server_url']) === '') return ['state' => 'noaddr'] + $base;
+    $r = attackfee_wp_server_call('GET', '/v1/owner/balance');
+    if ($r === null || $r['status'] !== 200) return ['state' => 'down'] + $base;
+    $b = $r['body'];
+    $fee = is_int($b['fee_bps'] ?? null) && $b['fee_bps'] >= 0 && $b['fee_bps'] <= 10000 ? $b['fee_bps'] : ATTACKFEE_WP_TEST_FEE_BPS;
+    return [
+        'state' => 'ok',
+        'usd' => is_string($b['available_usd'] ?? null) ? $b['available_usd'] : null,
+        'fee_bps' => $fee,
+        'paused' => !empty($b['degraded']),
+        'available_msat' => is_int($b['available_msat'] ?? null) ? $b['available_msat'] : null,
+    ];
+}
+
+/** One call to the owner's payment server. Returns [status, body] or null when it doesn't answer. */
+function attackfee_wp_server_call(string $method, string $path, ?array $json = null, float $timeout = ATTACKFEE_WP_SERVER_TIMEOUT_S): ?array
+{
+    $base = untrailingslashit((string) attackfee_wp_settings()['server_url']);
+    if (!preg_match('#^https?://#i', $base)) return null;
+    $args = [
+        'method' => $method,
+        'timeout' => $timeout,
+        'redirection' => 0,
+        'headers' => ['Authorization' => 'Bearer ' . attackfee_wp_server_key(), 'Accept' => 'application/json'],
+    ];
+    if ($json !== null) {
+        $args['headers']['Content-Type'] = 'application/json';
+        $args['body'] = wp_json_encode($json);
+    }
+    $r = wp_remote_request($base . $path, $args);
+    if (is_wp_error($r)) return null;
+    $code = (int) wp_remote_retrieve_response_code($r);
+    $body = json_decode((string) wp_remote_retrieve_body($r), true);
+    if ($code >= 500 && $code !== 503) return null;
+    return ['status' => $code, 'body' => is_array($body) ? $body : []];
+}
+
+/** Payment server chosen and an address set: paid redeems are forwarded there. */
+function attackfee_wp_server_configured(?array $s = null): bool
+{
+    $s ??= attackfee_wp_settings();
+    return $s['connection'] === 'server' && trim((string) $s['server_url']) !== '';
+}
+
+/**
+ * Agents are offered to pay only when the owner ticked "Collect usage payouts", chose Payment
+ * server and set its address. Test mode has no payment server, so agents get the work check.
+ */
+function attackfee_wp_offers_configured(?array $s = null): bool
+{
+    $s ??= attackfee_wp_settings();
+    return (bool) $s['payouts'] && attackfee_wp_server_configured($s);
+}
+
+/** Forget a recorded outage (settings saved). */
+function attackfee_wp_server_down_reset(): void
+{
+    delete_transient('attackfee_wp_server_down');
+}
+
+/**
+ * Request body for the payment server with the visitor's coarse network (network.php) added as `net`,
+ * so the server prices the offer for that network's load like its own 402. Left out when it cannot be
+ * worked out. The network is only sent: it is not stored, logged or cached here.
+ */
+function attackfee_wp_with_net(array $body): array
+{
+    $net = attackfee_wp_visitor_net();
+    return $net === null ? $body : $body + ['net' => $net];
+}
+
+/**
+ * Offers for an agent request, minted by the owner's payment server (POST /v1/owner/offers).
+ * Returns the offers plus the header to copy (`header` / `value`), or null: not configured, no
+ * offers, or the server is down, slow or answers wrongly. On a failure, agents skip the server
+ * for ATTACKFEE_WP_DOWN_CACHE_S. This site never builds or reads an offer itself.
+ */
+function attackfee_wp_relay_offers(string $action): ?array
+{
+    if (!attackfee_wp_offers_configured() || get_transient('attackfee_wp_server_down')) return null;
+    $r = attackfee_wp_server_call('POST', '/v1/owner/offers', attackfee_wp_with_net(['action' => $action]), ATTACKFEE_WP_OFFER_TIMEOUT_S);
+    if ($r === null || $r['status'] !== 200) {
+        set_transient('attackfee_wp_server_down', 1, ATTACKFEE_WP_DOWN_CACHE_S);
+        return null;
+    }
+    $relay = \Attackfee\Settlement::relayPayment(is_array($r['body'] ?? null) ? $r['body'] : []);
+    if ($relay === null) return null;
+    if ($relay['header'] === 'WWW-Authenticate') $relay['www_authenticate'] = $relay['value'];
+    return $relay;
+}
+
+/**
+ * Forward a paid redeem to the payment server (POST /v1/owner/redeem), which checks the payment
+ * proof, books it, and refuses a second use. The visitor's network goes with it, so the payment
+ * counts toward that network's load there. Returns [status, body]. Never a 500: a server that
+ * doesn't answer is 503.
+ */
+function attackfee_wp_relay_redeem(array $b): array
+{
+    if (!attackfee_wp_server_configured()) return [400, ['error' => 'unsupported', 'detail' => 'paid redeem is not enabled on this issuer']];
+    $fwd = \Attackfee\Settlement::forwardRedeem($b);
+    if ($fwd === null) return [400, ['error' => 'malformed']];
+    $fwd = attackfee_wp_with_net($fwd);
+    $r = attackfee_wp_server_call('POST', '/v1/owner/redeem', $fwd);
+    if ($r === null || $r['status'] === 503) return [503, ['error' => 'unavailable']];
+    $body = $r['body'];
+    if ($r['status'] === 200) {
+        $cls = $body['cls'] ?? null;
+        if (!empty($body['ok']) && is_string($cls) && $cls !== 'read' && isset(\Attackfee\Protocol::CLASS_MULT[$cls])) return [200, ['cls' => $cls]];
+        return [503, ['error' => 'unavailable']];
+    }
+    $err = is_string($body['error'] ?? null) && preg_match('/^[a-z_]{1,32}$/', $body['error']) ? $body['error'] : 'malformed';
+    // The site's own key was refused: the site is misconfigured, not the agent's payment.
+    if ($r['status'] === 401 && $err === 'unauthorized') return [503, ['error' => 'unavailable']];
+    return [in_array($r['status'], [400, 401, 402, 404, 409, 410], true) ? $r['status'] : 400, ['error' => $err]];
+}
+
+/**
+ * Withdraw through the owner's payment server only (POST /v1/owner/withdraw). The invoice is passed
+ * on as an opaque string: this plugin never reads an invoice (Amendment 1 §F); the payment server
+ * checks it and its amount against the balance before anything is sent.
+ * Returns ['ok' => true, 'usd' => '$X.XX'] or ['ok' => false, 'error' => 'too_much' | 'failed' | 'down'].
+ */
+function attackfee_wp_withdraw(string $invoice): array
+{
+    $s = attackfee_wp_settings();
+    $invoice = trim($invoice);
+    if (!$s['payouts'] || $invoice === '' || $s['connection'] !== 'server') return ['ok' => false, 'error' => 'failed'];
+    if (trim((string) $s['server_url']) === '') return ['ok' => false, 'error' => 'down'];
+    $r = attackfee_wp_server_call('POST', '/v1/owner/withdraw', ['invoice' => $invoice]);
+    if ($r === null || $r['status'] === 503) return ['ok' => false, 'error' => 'down'];
+    if ($r['status'] === 200 && !empty($r['body']['ok'])) return ['ok' => true, 'usd' => (string) ($r['body']['amount_usd'] ?? '')];
+    return ['ok' => false, 'error' => ($r['body']['error'] ?? '') === 'too_much' ? 'too_much' : 'failed'];
+}
+
+/**
+ * Forward an X-Cashu retry to the payment server (POST /v1/owner/cashu). Returns [status, body].
+ * The body on success is the server's class only; this site mints the pass.
+ */
+function attackfee_wp_relay_presented(string $token, string $action): array
+{
+    if (!attackfee_wp_server_configured()) return [400, ['error' => 'unsupported']];
+    $fwd = \Attackfee\Settlement::forwardPresented($token, $action);
+    if ($fwd === null) return [400, ['error' => 'malformed']];
+    $r = attackfee_wp_server_call('POST', '/v1/owner/cashu', attackfee_wp_with_net($fwd));
+    if ($r === null || $r['status'] === 503) return [503, ['error' => 'unavailable']];
+    $body = $r['body'];
+    if ($r['status'] === 200) {
+        $cls = $body['cls'] ?? null;
+        if (!empty($body['ok']) && is_string($cls) && $cls !== 'read' && isset(\Attackfee\Protocol::CLASS_MULT[$cls])) return [200, ['cls' => $cls]];
+        return [503, ['error' => 'unavailable']];
+    }
+    $err = is_string($body['error'] ?? null) && preg_match('/^[a-z_]{1,32}$/', $body['error']) ? $body['error'] : 'malformed';
+    if ($r['status'] === 401 && $err === 'unauthorized') return [503, ['error' => 'unavailable']];
+    return [in_array($r['status'], [400, 401, 402, 404, 409, 410], true) ? $r['status'] : 400, ['error' => $err]];
+}

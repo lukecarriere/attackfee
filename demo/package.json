@@ -1,0 +1,3 @@
+{ "name": "@attackfee/demo", "private": true, "version": "0.1.0", "license": "MIT", "type": "module",
+  "description": "Attackfee reference demo: forms, bot hammer, live stats.",
+  "dependencies": { "@attackfee/server": "0.1.0", "express": "^5.1.0" } }

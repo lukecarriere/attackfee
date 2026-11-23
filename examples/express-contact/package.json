@@ -1,0 +1,12 @@
+{
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@attackfee/server": "^0.1.0",
+    "express": "^5.1.0"
+  }
+}

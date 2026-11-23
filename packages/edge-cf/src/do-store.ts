@@ -1,0 +1,996 @@
+// SQLite-backed Durable Object store. One named instance serialises every write, so first-use,
+// use counts, tags and window counters are exact. Each method is one DO call (the SQL runs inside
+// the object). consumeTagged spends a pass and reads its tag in that one call. Any error fails
+// closed: the worker wrapper throws store_unavailable and the write is not forwarded.
+import { DurableObject } from "cloudflare:workers";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { AttackfeeError } from "../../protocol/src/index.ts";
+import type { AttackfeeStore } from "../../server-node/src/stores.ts";
+import { CashuReceiveEngine } from "../../settlement-ln/src/cashu-receive.ts";
+import { parseCashuMints } from "../../settlement-ln/src/cashu-net.ts";
+import { mintQuoteRechecks, quoteMode, REFUSAL_COUNT_TTL_S } from "../../settlement-ln/src/mint-quote.ts";
+import { emptySweepSummary, SWEEP_CURSOR_KEY, SWEEP_CURSOR_TTL_S, SWEEP_DEFAULT_BATCH, SWEEP_DEFAULT_BUDGET_MS, sweepMintQuotes, type SweepCandidate, type SweepSummary } from "../../settlement-ln/src/mint-quote-sweep.ts";
+import { claimPending, type CashuBooks, type PendingOutput, type PendingSwap, type ProofSnapshot, type ProofStore, type StoredProof } from "../../settlement-ln/src/cashu-store.ts";
+import { cashuFaultSlot, cashuFetch, type CashuEnv } from "./cashu-edge.ts";
+import { inputFee } from "../../settlement-ln/src/cashu-crypto.ts";
+import type { ReserveResult, WithdrawRow, WithdrawState } from "../../settlement-ln/src/cashu-melt.ts";
+import { holdAlert } from "./hold.ts";
+
+/** The edge `/demo/stats` body. `reversals` and `reversed_sats` live in cashu_meta rows (no new column). */
+export interface StoreCounts { accepted: number; rejected: number; reversals: number; reversed_sats: number }
+
+/** Additive increments for `/demo/stats/daily`. Whole sats only. */
+export interface DailyCounters { paid_writes?: number; free_writes?: number; sats_settled?: number; offers_402?: number }
+
+/** One UTC day in GET `/demo/stats/daily`. Old keys stay first and keep their meaning. */
+export interface DailyDay {
+  date: string;
+  accepted: number;
+  rejected: number;
+  test_accepted: number;
+  test_rejected: number;
+  paid_writes: number;
+  free_writes: number;
+  sats_settled: number;
+  offers_402: number;
+  test_paid_writes: number;
+  test_free_writes: number;
+  test_sats_settled: number;
+  test_offers_402: number;
+}
+
+/** What the owner routes read (GET /v1/owner/balance is built from it). Amounts and counts only: no proof, secret, or blinded value. */
+export interface OwnerBooks {
+  mints: { mint: string; stored_sat: number; proofs: number; withdrawing_sat: number; withdrawals_pending: number }[];
+  stored_sat: number;
+  proofs: number;
+  pending_swap_sat: number;
+  losses_sat: number;
+  withdrawing_sat: number;
+  withdrawn_sat: number;
+  withdraw_fee_sat: number;
+  /** Paid requests booked since the counter began (real and test-tagged). */
+  paid_requests: number;
+  /** Oldest first, at most 50. A quote id is not a credential. */
+  withdrawals_pending: { quote: string; mint: string; amount_sat: number }[];
+}
+
+/** Set true for the current request to make every store call fail closed. Unset: the store works. */
+export const storeFailSlot = new AsyncLocalStorage<boolean>();
+
+const num = (v: unknown) => Number(v);
+
+export class AttackfeeStoreDO extends DurableObject {
+  private sql: DurableObject["ctx"]["storage"]["sql"];
+  private sweepAt = 0;
+
+  constructor(ctx: DurableObject["ctx"], env: unknown) {
+    super(ctx, env);
+    this.sql = ctx.storage.sql;
+    this.sql.exec("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL, exp INTEGER NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS win (k TEXT PRIMARY KEY, start INTEGER NOT NULL, n INTEGER NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS day (d TEXT PRIMARY KEY, accepted INTEGER NOT NULL, rejected INTEGER NOT NULL)");
+    // Additive test-traffic columns. Old rows read as 0. Anyone may send `attackfee-test: 1` to move
+    // their own request into these columns and out of the public accepted/rejected totals.
+    const dayCols = this.sql.exec("PRAGMA table_info(day)").toArray().map((c) => String(c.name));
+    if (!dayCols.includes("test_accepted")) this.sql.exec("ALTER TABLE day ADD COLUMN test_accepted INTEGER NOT NULL DEFAULT 0");
+    if (!dayCols.includes("test_rejected")) this.sql.exec("ALTER TABLE day ADD COLUMN test_rejected INTEGER NOT NULL DEFAULT 0");
+    // Additive earnings columns. Old rows read as 0. Test traffic uses the test_* pair, same marker as today.
+    for (const col of ["paid_writes", "free_writes", "sats_settled", "offers_402", "test_paid_writes", "test_free_writes", "test_sats_settled", "test_offers_402"]) {
+      if (!dayCols.includes(col)) this.sql.exec(`ALTER TABLE day ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`);
+    }
+    this.sql.exec("CREATE TABLE IF NOT EXISTS cashu_proof (secret TEXT PRIMARY KEY, mint TEXT NOT NULL, unit TEXT NOT NULL, amount INTEGER NOT NULL, keyset TEXT NOT NULL, c TEXT NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS cashu_spent (h TEXT PRIMARY KEY)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS cashu_pending (id TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS cashu_meta (k TEXT PRIMARY KEY, n INTEGER NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS cashu_mint_quote (quote TEXT PRIMARY KEY, action TEXT NOT NULL, amount INTEGER NOT NULL, mint TEXT NOT NULL, proofs TEXT NOT NULL, outputs TEXT NOT NULL DEFAULT '[]')");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS cashu_mint_loss (quote TEXT PRIMARY KEY, action TEXT NOT NULL, amount INTEGER NOT NULL)");
+    const cols = this.sql.exec("PRAGMA table_info(cashu_mint_quote)").toArray();
+    if (!cols.some((c) => String(c.name) === "outputs")) {
+      this.sql.exec("ALTER TABLE cashu_mint_quote ADD COLUMN outputs TEXT NOT NULL DEFAULT '[]'");
+    }
+    // Additive columns on the loss table. Old rows read as reason '' and not recovered.
+    const lossCols = this.sql.exec("PRAGMA table_info(cashu_mint_loss)").toArray().map((c) => String(c.name));
+    if (!lossCols.includes("reason")) this.sql.exec("ALTER TABLE cashu_mint_loss ADD COLUMN reason TEXT NOT NULL DEFAULT ''");
+    if (!lossCols.includes("recovered")) this.sql.exec("ALTER TABLE cashu_mint_loss ADD COLUMN recovered INTEGER NOT NULL DEFAULT 0");
+    // The mint URL of the quote. Old rows read as '' (unknown mint), which the sweep leaves alone.
+    if (!lossCols.includes("mint")) this.sql.exec("ALTER TABLE cashu_mint_loss ADD COLUMN mint TEXT NOT NULL DEFAULT ''");
+    // When the row was written (unix seconds), so the sweep can skip rows a client may still present.
+    // Additive and idempotent. Old rows read as 0, which counts as old enough.
+    if (!cols.some((c) => String(c.name) === "at")) this.sql.exec("ALTER TABLE cashu_mint_quote ADD COLUMN at INTEGER NOT NULL DEFAULT 0");
+    if (!lossCols.includes("at")) this.sql.exec("ALTER TABLE cashu_mint_loss ADD COLUMN at INTEGER NOT NULL DEFAULT 0");
+    // Owner withdrawals. Additive: an empty table until the owner key is set and a melt is made.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS cashu_withdraw (quote TEXT PRIMARY KEY, mint TEXT NOT NULL, amount INTEGER NOT NULL, fee_reserve INTEGER NOT NULL, state TEXT NOT NULL, inputs TEXT NOT NULL, outputs TEXT NOT NULL, fee INTEGER NOT NULL DEFAULT 0, change INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL)");
+  }
+
+  /** Several statements, one commit. A throw rolls them back. */
+  private tx<T>(fn: () => T): T {
+    const storage = this.ctx.storage;
+    return typeof storage.transactionSync === "function" ? storage.transactionSync(fn) : fn();
+  }
+
+  private now() {
+    return Math.floor(Date.now() / 1000);
+  }
+
+  private sweep(now: number) {
+    if (now < this.sweepAt) return;
+    this.sweepAt = now + 30;
+    this.sql.exec("DELETE FROM kv WHERE exp <= ?", now);
+  }
+
+  private row(k: string): { v: string; exp: number } | undefined {
+    const rows = this.sql.exec("SELECT v, exp FROM kv WHERE k = ?", k).toArray();
+    const r = rows[0];
+    if (!r) return undefined;
+    return { v: String(r.v), exp: num(r.exp) };
+  }
+
+  firstUse(key: string, ttl_s: number): boolean {
+    const now = this.now();
+    this.sweep(now);
+    const k = "f:" + key;
+    const cur = this.row(k);
+    if (cur && cur.exp > now) return false;
+    const exp = now + Math.max(1, Math.ceil(ttl_s));
+    if (cur) this.sql.exec("UPDATE kv SET v = '1', exp = ? WHERE k = ?", exp, k);
+    else this.sql.exec("INSERT INTO kv (k, v, exp) VALUES (?, '1', ?)", k, exp);
+    return true;
+  }
+
+  consume(key: string, initial: number, ttl_s: number): number {
+    const now = this.now();
+    this.sweep(now);
+    const k = "n:" + key;
+    const cur = this.row(k);
+    const live = cur && cur.exp > now;
+    const left = live ? num(cur.v) : initial;
+    if (left <= 0) return -1;
+    const next = left - 1;
+    const exp = now + Math.max(1, Math.ceil(ttl_s));
+    if (cur) this.sql.exec("UPDATE kv SET v = ?, exp = ? WHERE k = ?", String(next), exp, k);
+    else this.sql.exec("INSERT INTO kv (k, v, exp) VALUES (?, ?, ?)", k, String(next), exp);
+    return next;
+  }
+
+  peek(key: string): number | null {
+    const now = this.now();
+    const cur = this.row("n:" + key);
+    if (!cur || cur.exp <= now) return null;
+    return num(cur.v);
+  }
+
+  setTag(key: string, tag: string, ttl_s: number): void {
+    const now = this.now();
+    const k = "t:" + key;
+    const exp = now + Math.max(1, Math.ceil(ttl_s));
+    const cur = this.row(k);
+    if (cur) this.sql.exec("UPDATE kv SET v = ?, exp = ? WHERE k = ?", tag, exp, k);
+    else this.sql.exec("INSERT INTO kv (k, v, exp) VALUES (?, ?, ?)", k, tag, exp);
+  }
+
+  getTag(key: string): string | null {
+    const now = this.now();
+    const cur = this.row("t:" + key);
+    if (!cur || cur.exp <= now) return null;
+    return cur.v;
+  }
+
+  /** Spend one use and read the pass tag. One DO call for a gated write. */
+  consumeTagged(useKey: string, initial: number, ttl_s: number, tagKey: string): { remaining: number; tag: string | null } {
+    const remaining = this.consume(useKey, initial, ttl_s);
+    const tag = remaining < 0 ? null : this.getTag(tagKey);
+    return { remaining, tag };
+  }
+
+  windowHit(key: string, window_s: number): number {
+    const now = this.now();
+    const rows = this.sql.exec("SELECT start, n FROM win WHERE k = ?", key).toArray();
+    const row = rows[0];
+    const start = row ? num(row.start) : 0;
+    if (!row || now - start >= window_s) {
+      if (row) this.sql.exec("UPDATE win SET start = ?, n = 1 WHERE k = ?", now, key);
+      else this.sql.exec("INSERT INTO win (k, start, n) VALUES (?, ?, 1)", key, now);
+      return 1;
+    }
+    const n = num(row.n) + 1;
+    this.sql.exec("UPDATE win SET n = ? WHERE k = ?", n, key);
+    return n;
+  }
+
+  windowCount(key: string, window_s: number): number {
+    const now = this.now();
+    const rows = this.sql.exec("SELECT start, n FROM win WHERE k = ?", key).toArray();
+    const row = rows[0];
+    if (!row || now - num(row.start) >= window_s) return 0;
+    return num(row.n);
+  }
+
+  private day(now = this.now()): string {
+    return new Date(now * 1000).toISOString().slice(0, 10);
+  }
+
+  note(kind: string, test = false): StoreCounts {
+    if (kind !== "accepted" && kind !== "rejected") throw new Error("bad kind");
+    const d = this.day();
+    const acc = !test && kind === "accepted" ? 1 : 0;
+    const rej = !test && kind === "rejected" ? 1 : 0;
+    const tacc = test && kind === "accepted" ? 1 : 0;
+    const trej = test && kind === "rejected" ? 1 : 0;
+    this.sql.exec(
+      "INSERT INTO day (d, accepted, rejected, test_accepted, test_rejected) VALUES (?, ?, ?, ?, ?) ON CONFLICT(d) DO UPDATE SET accepted = accepted + ?, rejected = rejected + ?, test_accepted = test_accepted + ?, test_rejected = test_rejected + ?",
+      d, acc, rej, tacc, trej, acc, rej, tacc, trej,
+    );
+    return this.counts();
+  }
+
+  /**
+   * Additive daily earnings counters. `test` moves the increment into the test_* columns, same
+   * marker as note(). No identifiers are stored. Values are non-negative integers (whole sats).
+   */
+  noteCounters(delta: DailyCounters, test = false): StoreCounts {
+    const keys = ["paid_writes", "free_writes", "sats_settled", "offers_402"] as const;
+    const inc: Record<(typeof keys)[number] | `test_${(typeof keys)[number]}`, number> = {
+      paid_writes: 0, free_writes: 0, sats_settled: 0, offers_402: 0,
+      test_paid_writes: 0, test_free_writes: 0, test_sats_settled: 0, test_offers_402: 0,
+    };
+    for (const k of keys) {
+      const n = delta[k] ?? 0;
+      if (!Number.isSafeInteger(n) || n < 0) throw new Error("bad delta");
+      if (test) inc[`test_${k}`] = n;
+      else inc[k] = n;
+    }
+    const d = this.day();
+    // All-time paid requests for the owner balance (a cashu_meta row, no new column).
+    if (delta.paid_writes) this.bumpMeta("paid_requests", delta.paid_writes);
+    this.sql.exec(
+      "INSERT INTO day (d, accepted, rejected, test_accepted, test_rejected, paid_writes, free_writes, sats_settled, offers_402, test_paid_writes, test_free_writes, test_sats_settled, test_offers_402) VALUES (?, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(d) DO UPDATE SET paid_writes = paid_writes + ?, free_writes = free_writes + ?, sats_settled = sats_settled + ?, offers_402 = offers_402 + ?, test_paid_writes = test_paid_writes + ?, test_free_writes = test_free_writes + ?, test_sats_settled = test_sats_settled + ?, test_offers_402 = test_offers_402 + ?",
+      d,
+      inc.paid_writes, inc.free_writes, inc.sats_settled, inc.offers_402,
+      inc.test_paid_writes, inc.test_free_writes, inc.test_sats_settled, inc.test_offers_402,
+      inc.paid_writes, inc.free_writes, inc.sats_settled, inc.offers_402,
+      inc.test_paid_writes, inc.test_free_writes, inc.test_sats_settled, inc.test_offers_402,
+    );
+    return this.counts();
+  }
+
+  /** Last `n` UTC days from the day table, oldest first, zeros filled. `n` is 1..30. */
+  daily(n: number): { days: DailyDay[] } {
+    const today = this.day();
+    const todayMs = Date.parse(today + "T00:00:00Z");
+    const dates: string[] = [];
+    for (let i = n - 1; i >= 0; i--) dates.push(new Date(todayMs - i * 86400000).toISOString().slice(0, 10));
+    const rows = this.sql.exec(
+      "SELECT d, accepted, rejected, test_accepted, test_rejected, paid_writes, free_writes, sats_settled, offers_402, test_paid_writes, test_free_writes, test_sats_settled, test_offers_402 FROM day WHERE d >= ? AND d <= ?",
+      dates[0], dates[dates.length - 1],
+    ).toArray();
+    const map = new Map(rows.map((r) => [String(r.d), r]));
+    return {
+      days: dates.map((date) => {
+        const r = map.get(date);
+        return {
+          date,
+          accepted: r ? num(r.accepted) : 0,
+          rejected: r ? num(r.rejected) : 0,
+          test_accepted: r ? num(r.test_accepted) : 0,
+          test_rejected: r ? num(r.test_rejected) : 0,
+          paid_writes: r ? num(r.paid_writes) : 0,
+          free_writes: r ? num(r.free_writes) : 0,
+          sats_settled: r ? num(r.sats_settled) : 0,
+          offers_402: r ? num(r.offers_402) : 0,
+          test_paid_writes: r ? num(r.test_paid_writes) : 0,
+          test_free_writes: r ? num(r.test_free_writes) : 0,
+          test_sats_settled: r ? num(r.test_sats_settled) : 0,
+          test_offers_402: r ? num(r.test_offers_402) : 0,
+        };
+      }),
+    };
+  }
+
+  /** Today's accepted and rejected, plus all-time mint-quote loss reversals and the sats they reversed. */
+  counts(): StoreCounts {
+    const rows = this.sql.exec("SELECT accepted, rejected FROM day WHERE d = ?", this.day()).toArray();
+    const row = rows[0];
+    const reversals = { reversals: this.metaN("reversals"), reversed_sats: this.metaN("reversed_sats") };
+    if (!row) return { accepted: 0, rejected: 0, ...reversals };
+    return { accepted: num(row.accepted), rejected: num(row.rejected), ...reversals };
+  }
+
+  private metaN(k: string): number {
+    const rows = this.sql.exec("SELECT n FROM cashu_meta WHERE k = ?", k).toArray();
+    return rows.length ? num(rows[0].n) : 0;
+  }
+
+  private bumpMeta(k: string, n: number): void {
+    this.sql.exec("INSERT INTO cashu_meta (k, n) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET n = n + ?", k, n, n);
+  }
+
+  private envOf(): CashuEnv {
+    return (this.env ?? {}) as CashuEnv;
+  }
+
+  private lossN(): number {
+    const rows = this.sql.exec("SELECT n FROM cashu_meta WHERE k = 'losses'").toArray();
+    return rows.length ? num(rows[0].n) : 0;
+  }
+
+  private addLoss(n: number): void {
+    if (!n) return;
+    this.sql.exec("INSERT INTO cashu_meta (k, n) VALUES ('losses', ?) ON CONFLICT(k) DO UPDATE SET n = n + ?", n, n);
+  }
+
+  private pendingRows(): PendingSwap[] {
+    const out: PendingSwap[] = [];
+    for (const row of this.sql.exec("SELECT body FROM cashu_pending").toArray()) {
+      const body = JSON.parse(String(row.body)) as PendingSwap;
+      if (body && typeof body.id === "string" && Array.isArray(body.outputs)) out.push(body);
+    }
+    return out;
+  }
+
+  private proofRows(): StoredProof[] {
+    return this.sql.exec("SELECT mint, unit, amount, keyset, secret, c FROM cashu_proof").toArray().map((r) => ({
+      mint: String(r.mint),
+      unit: "sat" as const,
+      amount: num(r.amount),
+      id: String(r.keyset),
+      secret: String(r.secret),
+      C: String(r.c),
+    }));
+  }
+
+  private spentRows(): string[] {
+    return this.sql.exec("SELECT h FROM cashu_spent").toArray().map((r) => String(r.h));
+  }
+
+  cashuRead(): ProofSnapshot {
+    return { proofs: this.proofRows(), spent: this.spentRows(), pending: this.pendingRows(), losses: this.lossN() };
+  }
+
+  cashuBooks(): CashuBooks {
+    const snap = this.cashuRead();
+    const stored = snap.proofs.reduce((n, p) => n + p.amount, 0);
+    const pending = snap.pending.reduce((n, p) => n + p.outSats, 0);
+    return { stored, pending, losses: snap.losses, spent: snap.spent.length, inSats: stored + pending + snap.losses };
+  }
+
+  ownerBooks(): OwnerBooks {
+    const mints = new Map<string, OwnerBooks["mints"][number]>();
+    const row = (mint: string) => {
+      let m = mints.get(mint);
+      if (!m) { m = { mint, stored_sat: 0, proofs: 0, withdrawing_sat: 0, withdrawals_pending: 0 }; mints.set(mint, m); }
+      return m;
+    };
+    for (const r of this.sql.exec("SELECT mint, COUNT(*) AS n, COALESCE(SUM(amount), 0) AS s FROM cashu_proof GROUP BY mint").toArray()) {
+      const m = row(String(r.mint));
+      m.proofs = num(r.n);
+      m.stored_sat = num(r.s);
+    }
+    const pendingRows = this.sql.exec("SELECT quote, mint, amount, inputs FROM cashu_withdraw WHERE state = 'pending' ORDER BY at, quote").toArray();
+    for (const r of pendingRows) {
+      const m = row(String(r.mint));
+      m.withdrawals_pending++;
+      m.withdrawing_sat += (JSON.parse(String(r.inputs)) as StoredProof[]).reduce((n, p) => n + p.amount, 0);
+    }
+    const list = [...mints.values()].sort((a, b) => a.mint.localeCompare(b.mint));
+    const books = this.cashuBooks();
+    return {
+      mints: list,
+      stored_sat: list.reduce((n, m) => n + m.stored_sat, 0),
+      proofs: list.reduce((n, m) => n + m.proofs, 0),
+      pending_swap_sat: books.pending,
+      losses_sat: books.losses,
+      withdrawing_sat: list.reduce((n, m) => n + m.withdrawing_sat, 0),
+      withdrawn_sat: this.metaN("withdrawn_sats"),
+      withdraw_fee_sat: this.metaN("withdraw_fee_sats"),
+      paid_requests: this.metaN("paid_requests"),
+      withdrawals_pending: pendingRows.slice(0, 50).map((r) => ({ quote: String(r.quote), mint: String(r.mint), amount_sat: num(r.amount) })),
+    };
+  }
+
+  withdrawStoredAt(mint: string): number {
+    const rows = this.sql.exec("SELECT COALESCE(SUM(amount), 0) AS s FROM cashu_proof WHERE mint = ?", mint).toArray();
+    return num(rows[0]?.s ?? 0);
+  }
+
+  /**
+   * One transaction: pick stored proofs at `mint` that cover amount + fee reserve + input fees,
+   * delete them from cashu_proof, and write them with the blank outputs into one pending row.
+   * A proof is never in both tables, so two withdrawals cannot spend the same proof.
+   */
+  withdrawReserve(o: { quote: string; mint: string; amount: number; feeReserve: number; ppk: Record<string, number>; outputs: PendingOutput[]; maxInputs: number }): ReserveResult {
+    return this.tx((): ReserveResult => {
+      if (this.sql.exec("SELECT quote FROM cashu_withdraw WHERE quote = ?", o.quote).toArray().length) return { ok: false, error: "exists" };
+      // One withdrawal at a time: while one is pending its outcome is unknown, so nothing else is sent.
+      if (this.sql.exec("SELECT quote FROM cashu_withdraw WHERE state = 'pending' LIMIT 1").toArray().length) return { ok: false, error: "busy" };
+      const rows = this.sql.exec("SELECT secret, amount, keyset, c FROM cashu_proof WHERE mint = ? ORDER BY amount DESC, secret", o.mint).toArray();
+      const picked: StoredProof[] = [];
+      let sum = 0;
+      const need = () => o.amount + o.feeReserve + inputFee(picked.map((p) => o.ppk[p.id.toLowerCase()] ?? 0));
+      for (const r of rows) {
+        if (sum >= need()) break;
+        picked.push({ mint: o.mint, unit: "sat", amount: num(r.amount), id: String(r.keyset), secret: String(r.secret), C: String(r.c) });
+        sum += num(r.amount);
+      }
+      if (sum < need()) return { ok: false, error: "too_much" };
+      if (picked.length > o.maxInputs) return { ok: false, error: "too_many_inputs" };
+      for (const p of picked) this.sql.exec("DELETE FROM cashu_proof WHERE secret = ?", p.secret);
+      this.sql.exec(
+        "INSERT INTO cashu_withdraw (quote, mint, amount, fee_reserve, state, inputs, outputs, at) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+        o.quote, o.mint, o.amount, o.feeReserve, JSON.stringify(picked), JSON.stringify(o.outputs), this.now(),
+      );
+      return { ok: true, inputs: picked };
+    });
+  }
+
+  withdrawGet(quote: string): WithdrawRow | null {
+    const r = this.sql.exec("SELECT quote, mint, amount, fee_reserve, state, inputs, outputs, fee, change, at FROM cashu_withdraw WHERE quote = ?", quote).toArray()[0];
+    if (!r) return null;
+    return {
+      quote: String(r.quote), mint: String(r.mint), amount: num(r.amount), feeReserve: num(r.fee_reserve), state: String(r.state) as WithdrawState, at: num(r.at),
+      inputs: JSON.parse(String(r.inputs)) as StoredProof[], outputs: JSON.parse(String(r.outputs)) as PendingOutput[], fee: num(r.fee), change: num(r.change),
+    };
+  }
+
+  /**
+   * One transaction: store the change, close the row, and book the amount and the fee. Null unless
+   * the row is pending, or released but still carrying its inputs (the mint paid it after all).
+   * For a released row the spent inputs leave the store, and any pending row that reserved one of
+   * them is released (a melt with a spent input is never paid), keeping its other proofs.
+   */
+  withdrawFinish(o: { quote: string; change: StoredProof[] }): { amount: number; fee: number; change: number } | null {
+    return this.tx(() => {
+      const row = this.withdrawGet(o.quote);
+      if (!row || !(row.state === "pending" || (row.state === "released" && row.inputs.length > 0))) return null;
+      const inSum = row.inputs.reduce((n, p) => n + p.amount, 0);
+      const change = o.change.reduce((n, p) => n + p.amount, 0);
+      const fee = inSum - row.amount - change;
+      if (fee < 0) throw new AttackfeeError("store_unavailable");
+      if (row.state === "released") {
+        const spent = new Set(row.inputs.map((p) => p.secret));
+        for (const p of row.inputs) this.sql.exec("DELETE FROM cashu_proof WHERE secret = ?", p.secret);
+        for (const r of this.sql.exec("SELECT quote FROM cashu_withdraw WHERE state = 'pending' AND quote != ?", o.quote).toArray()) {
+          const other = this.withdrawGet(String(r.quote))!;
+          if (!other.inputs.some((p) => spent.has(p.secret))) continue;
+          for (const p of other.inputs) {
+            if (spent.has(p.secret)) continue;
+            this.sql.exec("INSERT INTO cashu_proof (secret, mint, unit, amount, keyset, c) VALUES (?, ?, 'sat', ?, ?, ?) ON CONFLICT(secret) DO NOTHING", p.secret, other.mint, p.amount, p.id, p.C);
+          }
+          this.sql.exec("UPDATE cashu_withdraw SET state = 'released' WHERE quote = ?", other.quote);
+        }
+      }
+      for (const p of o.change) {
+        this.sql.exec("INSERT INTO cashu_proof (secret, mint, unit, amount, keyset, c) VALUES (?, ?, 'sat', ?, ?, ?) ON CONFLICT(secret) DO NOTHING", p.secret, row.mint, p.amount, p.id, p.C);
+      }
+      this.sql.exec("UPDATE cashu_withdraw SET state = 'paid', inputs = '[]', outputs = '[]', fee = ?, change = ? WHERE quote = ?", fee, change, o.quote);
+      this.bumpMeta("withdrawn_sats", row.amount);
+      if (fee) this.bumpMeta("withdraw_fee_sats", fee);
+      return { amount: row.amount, fee, change };
+    });
+  }
+
+  /**
+   * Held-balance ceiling. `over` when the stored amount is at or above `thresholdMsat`; `alert`
+   * the first time that is seen on a UTC day (one log line per day). Reads and one meta write only.
+   */
+  holdCheck(thresholdMsat: number): { available_msat: number; over: boolean; alert: boolean } {
+    const rows = this.sql.exec("SELECT COALESCE(SUM(amount), 0) AS s FROM cashu_proof").toArray();
+    const available = num(rows[0]?.s ?? 0) * 1000;
+    const today = Number(this.day().replaceAll("-", ""));
+    const r = holdAlert(available, thresholdMsat, this.metaN("hold_alert_day"), today);
+    if (r.alert) this.sql.exec("INSERT INTO cashu_meta (k, n) VALUES ('hold_alert_day', ?) ON CONFLICT(k) DO UPDATE SET n = ?", today, today);
+    return { available_msat: available, ...r };
+  }
+
+  /**
+   * One transaction: the mint never took the inputs, so they go back to cashu_proof. Only a pending
+   * row older than `minAgeS` seconds (0: no age rule). The row keeps its inputs and blank outputs so
+   * a later PAID from the mint can still be settled (finish) and the change restored.
+   */
+  withdrawRelease(quote: string, minAgeS = 0): boolean {
+    return this.tx(() => {
+      const row = this.withdrawGet(quote);
+      if (!row || row.state !== "pending") return false;
+      if (minAgeS > 0 && this.now() - (row.at ?? 0) <= minAgeS) return false;
+      for (const p of row.inputs) {
+        this.sql.exec("INSERT INTO cashu_proof (secret, mint, unit, amount, keyset, c) VALUES (?, ?, 'sat', ?, ?, ?) ON CONFLICT(secret) DO NOTHING", p.secret, row.mint, p.amount, p.id, p.C);
+      }
+      this.sql.exec("UPDATE cashu_withdraw SET state = 'released' WHERE quote = ?", quote);
+      return true;
+    });
+  }
+
+  /** Released rows reserved in the last `withinS` seconds that still carry their inputs (newest first, at most 5). */
+  withdrawRecheckable(withinS: number): string[] {
+    return this.sql.exec("SELECT quote FROM cashu_withdraw WHERE state = 'released' AND inputs != '[]' AND at >= ? ORDER BY at DESC LIMIT 5", this.now() - withinS).toArray().map((r) => String(r.quote));
+  }
+
+  /** Persist a pending swap. Throws replay when an input is already spent. Returns the row that owns those inputs. */
+  beginPending(p: PendingSwap): PendingSwap {
+    for (const h of p.marks) {
+      if (this.sql.exec("SELECT h FROM cashu_spent WHERE h = ?", h).toArray().length) throw new AttackfeeError("replay");
+    }
+    const existing = claimPending(this.pendingRows(), p);
+    if (existing) return existing;
+    this.sql.exec("INSERT INTO cashu_pending (id, body) VALUES (?, ?)", p.id, JSON.stringify(p));
+    this.addLoss(p.inSats - p.outSats);
+    return p;
+  }
+
+  commitPending(o: { id: string; proofs: StoredProof[]; marks: string[] }): void {
+    const rows = this.sql.exec("SELECT body FROM cashu_pending WHERE id = ?", o.id).toArray();
+    if (!rows.length) {
+      if (o.marks.length > 0 && o.marks.every((h) => this.sql.exec("SELECT h FROM cashu_spent WHERE h = ?", h).toArray().length > 0)) return;
+      throw new AttackfeeError("store_unavailable");
+    }
+    const pending = JSON.parse(String(rows[0].body)) as PendingSwap;
+    const got = o.proofs.reduce((n, p) => n + p.amount, 0);
+    if (got !== pending.outSats) throw new AttackfeeError("store_unavailable");
+    for (const p of o.proofs) {
+      this.sql.exec(
+        "INSERT INTO cashu_proof (secret, mint, unit, amount, keyset, c) VALUES (?, ?, ?, ?, ?, ?)",
+        p.secret, p.mint, p.unit, p.amount, p.id, p.C,
+      );
+    }
+    for (const h of o.marks) this.sql.exec("INSERT INTO cashu_spent (h) VALUES (?) ON CONFLICT(h) DO NOTHING", h);
+    this.sql.exec("DELETE FROM cashu_pending WHERE id = ?", o.id);
+  }
+
+  leasePending(id: string, owner: string, exp: number): void {
+    const rows = this.sql.exec("SELECT body FROM cashu_pending WHERE id = ?", id).toArray();
+    if (!rows.length) return;
+    const pending = JSON.parse(String(rows[0].body)) as PendingSwap;
+    if (pending.owner !== undefined && pending.owner !== owner) return;
+    if (pending.at === undefined) pending.at = Date.now();
+    pending.owner = owner;
+    pending.leaseExp = exp;
+    this.sql.exec("UPDATE cashu_pending SET body = ? WHERE id = ?", JSON.stringify(pending), id);
+  }
+
+  abortPending(id: string): void {
+    const rows = this.sql.exec("SELECT body FROM cashu_pending WHERE id = ?", id).toArray();
+    if (!rows.length) return;
+    const pending = JSON.parse(String(rows[0].body)) as PendingSwap;
+    const fee = pending.inSats - pending.outSats;
+    if (fee) this.sql.exec("UPDATE cashu_meta SET n = ? WHERE k = 'losses'", Math.max(0, this.lossN() - fee));
+    this.sql.exec("DELETE FROM cashu_pending WHERE id = ?", id);
+  }
+
+  losePending(o: { id: string; marks: string[] }): void {
+    const rows = this.sql.exec("SELECT body FROM cashu_pending WHERE id = ?", o.id).toArray();
+    if (!rows.length) return;
+    const pending = JSON.parse(String(rows[0].body)) as PendingSwap;
+    this.addLoss(pending.outSats);
+    this.sql.exec("DELETE FROM cashu_pending WHERE id = ?", o.id);
+    for (const h of o.marks) this.sql.exec("INSERT INTO cashu_spent (h) VALUES (?) ON CONFLICT(h) DO NOTHING", h);
+  }
+
+  /** One DO call. The worker's ProofStore uses these so every proof write is serialised on this instance. */
+  async cashuBegin(p: PendingSwap): Promise<{ ok: true; pending: PendingSwap } | { ok: false; error: "replay" }> {
+    try {
+      const pending = this.beginPending(p);
+      try { await this.armAlarm(); } catch { /* a later request still recovers */ }
+      return { ok: true, pending };
+    } catch (e) {
+      if (e instanceof AttackfeeError && e.code === "replay") return { ok: false, error: "replay" };
+      throw e;
+    }
+  }
+
+  async cashuCommit(o: { id: string; proofs: StoredProof[]; marks: string[] }): Promise<{ ok: true } | { ok: false; error: "store_unavailable" }> {
+    try {
+      this.commitPending(o);
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof AttackfeeError) return { ok: false, error: "store_unavailable" };
+      throw e;
+    }
+  }
+
+  async cashuLease(id: string, owner: string, exp: number): Promise<{ ok: true }> {
+    this.leasePending(id, owner, exp);
+    return { ok: true };
+  }
+
+  async cashuAbort(id: string): Promise<{ ok: true }> {
+    this.abortPending(id);
+    return { ok: true };
+  }
+
+  /**
+   * Single-use mark before the mint signs. One transaction: the quote row (proofs still empty,
+   * blinded outputs already filled) and the in-flight lease. Proofs land later, in finishMintQuote.
+   */
+  reserveMintQuote(row: { quote: string; action: string; amount: number; mint: string; outputs?: { amount: number; id: string; secret: string; r: string; B_: string }[] }): boolean {
+    const outputs = JSON.stringify(row.outputs ?? []);
+    const exp = this.now() + 30;
+    return this.tx(() => {
+      if (this.sql.exec("SELECT quote FROM cashu_mint_quote WHERE quote = ?", row.quote).toArray().length) return false;
+      this.sql.exec(
+        "INSERT INTO cashu_mint_quote (quote, action, amount, mint, proofs, outputs, at) VALUES (?, ?, ?, ?, '[]', ?, ?)",
+        row.quote, row.action, row.amount, row.mint, outputs, exp - 30,
+      );
+      this.sql.exec(
+        "INSERT INTO kv (k, v, exp) VALUES (?, '1', ?) ON CONFLICT(k) DO UPDATE SET v = '1', exp = excluded.exp",
+        "f:mq:" + row.quote, exp,
+      );
+      return true;
+    });
+  }
+
+  /** Open row with an expired lease. Renews the lease. Null when the row is finished or still leased. */
+  claimOpenMintQuote(quote: string): { amount: number; id: string; secret: string; r: string; B_: string }[] | null {
+    const now = this.now();
+    return this.tx(() => {
+      const rows = this.sql.exec("SELECT proofs, outputs FROM cashu_mint_quote WHERE quote = ?", quote).toArray();
+      if (!rows.length) return null;
+      let proofs: unknown = [];
+      try { proofs = JSON.parse(String(rows[0].proofs)); } catch { return null; }
+      if (!Array.isArray(proofs) || proofs.length > 0) return null;
+      const lease = this.sql.exec("SELECT exp FROM kv WHERE k = ?", "f:mq:" + quote).toArray();
+      if (lease.length && num(lease[0].exp) > now) return null;
+      const exp = now + 30;
+      this.sql.exec(
+        "INSERT INTO kv (k, v, exp) VALUES (?, '1', ?) ON CONFLICT(k) DO UPDATE SET v = '1', exp = excluded.exp",
+        "f:mq:" + quote, exp,
+      );
+      let outputs: unknown = [];
+      try { outputs = JSON.parse(String(rows[0].outputs ?? "[]")); } catch { return null; }
+      return Array.isArray(outputs) ? outputs as { amount: number; id: string; secret: string; r: string; B_: string }[] : null;
+    });
+  }
+
+  /** Delete an open reservation and its lease. False once proofs are stored. */
+  releaseMintQuote(quote: string): boolean {
+    return this.tx(() => {
+      const rows = this.sql.exec("SELECT proofs FROM cashu_mint_quote WHERE quote = ?", quote).toArray();
+      if (!rows.length) return false;
+      let proofs: unknown = [];
+      try { proofs = JSON.parse(String(rows[0].proofs)); } catch { return false; }
+      if (!Array.isArray(proofs) || proofs.length > 0) return false;
+      this.sql.exec("DELETE FROM cashu_mint_quote WHERE quote = ?", quote);
+      this.sql.exec("DELETE FROM kv WHERE k = ?", "f:mq:" + quote);
+      return true;
+    });
+  }
+
+  /** The next presentation may claim this open row. Proofs stay put. */
+  unlockMintQuote(quote: string): void {
+    this.tx(() => {
+      const rows = this.sql.exec("SELECT proofs FROM cashu_mint_quote WHERE quote = ?", quote).toArray();
+      if (!rows.length) return;
+      let proofs: unknown = [];
+      try { proofs = JSON.parse(String(rows[0].proofs)); } catch { return; }
+      if (!Array.isArray(proofs) || proofs.length > 0) return;
+      this.sql.exec("DELETE FROM kv WHERE k = ?", "f:mq:" + quote);
+    });
+  }
+
+  /** Proofs for a reserved quote. One transaction, so the proof rows and the used mark land together. */
+  finishMintQuote(row: { quote: string; proofs: { amount: number; secret: string; id: string; C: string }[] }): boolean {
+    // Log after the transaction commits, never inside a transaction that then rolls back.
+    const result = this.tx(() => {
+      const rows = this.sql.exec("SELECT mint, proofs FROM cashu_mint_quote WHERE quote = ?", row.quote).toArray();
+      if (!rows.length) return { ok: false, reversed: null as { quote: string; amount: number } | null };
+      let existing: unknown = [];
+      try { existing = JSON.parse(String(rows[0].proofs)); } catch { return { ok: false, reversed: null }; }
+      if (!Array.isArray(existing) || existing.length > 0) return { ok: false, reversed: null };
+      this.sql.exec("UPDATE cashu_mint_quote SET proofs = ? WHERE quote = ?", JSON.stringify(row.proofs), row.quote);
+      const mint = String(rows[0].mint);
+      for (const p of row.proofs) {
+        this.sql.exec(
+          "INSERT INTO cashu_proof (secret, mint, unit, amount, keyset, c) VALUES (?, ?, 'sat', ?, ?, ?)",
+          p.secret, mint, p.amount, p.id, p.C,
+        );
+      }
+      // MINT_QUOTE_GUARD loss-reversal: a booked loss is reversed by the proofs that recover it, in the same transaction.
+      const lost = this.sql.exec("SELECT amount FROM cashu_mint_loss WHERE quote = ? AND recovered = 0", row.quote).toArray();
+      if (lost.length) {
+        this.sql.exec("UPDATE cashu_mint_loss SET recovered = 1 WHERE quote = ?", row.quote);
+        this.sql.exec("UPDATE cashu_meta SET n = ? WHERE k = 'losses'", Math.max(0, this.lossN() - num(lost[0].amount)));
+        this.bumpMeta("reversals", 1);
+        this.bumpMeta("reversed_sats", num(lost[0].amount));
+        return { ok: true, reversed: { quote: row.quote, amount: num(lost[0].amount) } };
+      }
+      return { ok: true, reversed: null };
+    });
+    if (result.reversed) {
+      console.log(JSON.stringify({ event: "mint_quote_reversed", quote: result.reversed.quote, amount: result.reversed.amount }));
+    }
+    return result.ok;
+  }
+
+  /** Quote row, proofs, and the single-use mark. Reserve then finish, each its own statement list. */
+  claimMintQuote(row: { quote: string; action: string; amount: number; mint: string; proofs: { amount: number; secret: string; id: string; C: string }[] }): boolean {
+    if (!this.reserveMintQuote(row)) return false;
+    return this.finishMintQuote(row);
+  }
+
+  hasMintQuote(quote: string): boolean {
+    return this.sql.exec("SELECT quote FROM cashu_mint_quote WHERE quote = ?", quote).toArray().length > 0;
+  }
+
+  noteMintQuoteLoss(o: { quote: string; action: string; amount: number; reason?: string; mint?: string }): void {
+    if (this.sql.exec("SELECT quote FROM cashu_mint_loss WHERE quote = ?", o.quote).toArray().length) return;
+    this.sql.exec("INSERT INTO cashu_mint_loss (quote, action, amount, reason, mint, at) VALUES (?, ?, ?, ?, ?, ?)", o.quote, o.action, o.amount, o.reason ?? "", o.mint ?? "", this.now());
+    this.addLoss(o.amount);
+  }
+
+  /**
+   * Quotes the sweep may retry, after `after` in quote order: open rows (no proofs) at least
+   * minAgeS old, each with its unrecovered loss whatever that loss's age; and unrecovered losses at
+   * least minAgeS old with no row, except issued_no_row (nothing left to mint). Mirrors the Node
+   * MemoryStore listing.
+   */
+  mintQuoteSweepCandidates(q: { after: string; limit: number; minAgeS: number }): SweepCandidate[] {
+    const cutoff = this.now() - q.minAgeS;
+    const limit = Math.max(0, Math.min(1000, Math.floor(q.limit)));
+    if (!limit) return [];
+    const rows = this.sql.exec(
+      `SELECT quote, action, amount, mint, lost FROM (
+         SELECT m.quote AS quote, m.action AS action, m.amount AS amount, m.mint AS mint, COALESCE(l.amount, 0) AS lost
+           FROM cashu_mint_quote m LEFT JOIN cashu_mint_loss l ON l.quote = m.quote AND l.recovered = 0
+          WHERE m.proofs = '[]' AND m.at <= ?
+         UNION ALL
+         SELECT l.quote, l.action, l.amount, l.mint, l.amount
+           FROM cashu_mint_loss l
+          WHERE l.recovered = 0 AND l.at <= ? AND l.reason <> 'issued_no_row'
+            AND NOT EXISTS (SELECT 1 FROM cashu_mint_quote m WHERE m.quote = l.quote)
+       ) WHERE quote > ? ORDER BY quote LIMIT ?`,
+      cutoff, cutoff, q.after, limit,
+    ).toArray();
+    return rows.map((r) => ({ quote: String(r.quote), action: String(r.action), amount: num(r.amount), mint: String(r.mint), lost: num(r.lost) }));
+  }
+
+  /**
+   * One bounded sweep of stored mint quotes (the cron entry point). Runs in the object so the store
+   * calls are local. Mint calls are capped at SWEEP_MAX_CALLS, and those calls plus DNS plus the
+   * cron RPC stay within the sweep's subrequest ceiling. The same lease, refusal-cap and re-check
+   * rows as a presentation guard it.
+   */
+  async mintQuoteSweep(o: { batch?: number; budgetMs?: number } = {}): Promise<SweepSummary> {
+    const env = this.envOf();
+    const hooks = env.ATTACKFEE_TEST_HOOKS === "1";
+    const mints = parseCashuMints(env.CASHU_MINTS, hooks);
+    const mode = quoteMode(env);
+    if (!mints.length || mode === "off") return emptySweepSummary();
+    const fetchImpl = cashuFetch(env, mints);
+    const counters = {
+      consume: async (key: string, initial: number, ttl: number) => this.consume(key, initial, ttl),
+      peek: async (key: string) => this.peek(key) ?? undefined,
+      firstUse: async (key: string, ttl: number) => this.firstUse(key, ttl),
+    };
+    return sweepMintQuotes({
+      mint: mints[0], fetchImpl, mode, allowlist: mints,
+      guard: { lookup: hooks ? async () => ["1.1.1.1"] : undefined, fetch: fetchImpl },
+      has: async (q) => this.hasMintQuote(q),
+      reserve: async (r) => this.reserveMintQuote(r),
+      claimOpen: async (q) => this.claimOpenMintQuote(q),
+      release: async (q) => this.releaseMintQuote(q),
+      unlock: async (q) => this.unlockMintQuote(q),
+      finish: async (r) => this.finishMintQuote(r),
+      noteLoss: async (x) => this.noteMintQuoteLoss(x),
+      refusalsLeft: (q, cap) => counters.consume("f:mqr:" + q, cap, REFUSAL_COUNT_TTL_S),
+      rechecks: mintQuoteRechecks(counters),
+      candidates: async (q) => this.mintQuoteSweepCandidates(q),
+      cursor: { get: async () => this.getTag(SWEEP_CURSOR_KEY) ?? undefined, set: async (q) => this.setTag(SWEEP_CURSOR_KEY, q, SWEEP_CURSOR_TTL_S) },
+      tags: { get: async (k) => this.getTag(k) ?? undefined, set: async (k, v, ttl) => this.setTag(k, v, ttl) },
+      clock: () => Date.now(),
+    }, { batch: o.batch ?? SWEEP_DEFAULT_BATCH, budgetMs: o.budgetMs ?? SWEEP_DEFAULT_BUDGET_MS });
+  }
+
+  /** Test hooks only: write an open row or a loss as if it were `ageS` old. */
+  async mintQuoteSeed(o: { quote: string; action: string; amount: number; mint: string; ageS: number; open?: boolean; loss?: string }): Promise<{ ok: boolean }> {
+    if (this.envOf().ATTACKFEE_TEST_HOOKS !== "1") return { ok: false };
+    const at = this.now() - Math.max(0, Math.floor(o.ageS));
+    if (o.open) {
+      this.sql.exec("INSERT INTO cashu_mint_quote (quote, action, amount, mint, proofs, outputs, at) VALUES (?, ?, ?, ?, '[]', '[]', ?) ON CONFLICT(quote) DO NOTHING", o.quote, o.action, o.amount, o.mint, at);
+    }
+    if (o.loss !== undefined) {
+      this.noteMintQuoteLoss({ quote: o.quote, action: o.action, amount: o.amount, reason: o.loss, mint: o.mint });
+      this.sql.exec("UPDATE cashu_mint_loss SET at = ? WHERE quote = ?", at, o.quote);
+    }
+    return { ok: true };
+  }
+
+  async cashuLose(o: { id: string; marks: string[] }): Promise<{ ok: true }> {
+    this.losePending(o);
+    return { ok: true };
+  }
+
+  async cashuNoteSigned(amount: number, marks: string[]): Promise<{ ok: true }> {
+    this.noteSignedPending(amount, marks);
+    return { ok: true };
+  }
+
+  private noteSignedPending(amount: number, marks: string[]): void {
+    if (marks.length > 0 && marks.every((h) => this.sql.exec("SELECT h FROM cashu_spent WHERE h = ?", h).toArray().length > 0)) return;
+    if (this.pendingRows().some((p) => p.marks.some((h) => marks.includes(h)))) return;
+    if (!Number.isSafeInteger(amount) || amount <= 0) return;
+    this.addLoss(amount);
+    for (const h of marks) this.sql.exec("INSERT INTO cashu_spent (h) VALUES (?) ON CONFLICT(h) DO NOTHING", h);
+  }
+
+  /** NUT-09 / NUT-07 for swaps saved before the mint call. Does not grant a gate. */
+  async cashuRecover(): Promise<{ ok: true }> {
+    const env = this.envOf();
+    const mints = parseCashuMints(env.CASHU_MINTS, env.ATTACKFEE_TEST_HOOKS === "1");
+    if (!mints.length || !this.pendingRows().length) return { ok: true };
+    const engine = new CashuReceiveEngine({
+      secret: "durable-object-recover-1",
+      mints,
+      store: this.localStore(),
+      lookup: env.ATTACKFEE_TEST_HOOKS === "1" ? async () => ["1.1.1.1"] : undefined,
+      fetch: cashuFetch(env, mints),
+    });
+    await engine.recoverSaved();
+    if (!this.pendingRows().length) {
+      try { await this.ctx.storage.deleteAlarm?.(); } catch { /* alarm is optional */ }
+    }
+    return { ok: true };
+  }
+
+  async alarm(): Promise<void> {
+    await this.cashuRecover();
+    if (this.pendingRows().length) {
+      try { await this.armAlarm(); } catch { /* next request recovers */ }
+    }
+  }
+
+  private async armAlarm(): Promise<void> {
+    await this.ctx.storage.setAlarm?.(Date.now() + 60_000);
+  }
+
+  /** In-object store for alarm recovery. The request path uses RPC so the mint call stays outside the DO. */
+  private localStore(): ProofStore {
+    return {
+      read: async () => this.cashuRead(),
+      books: async () => this.cashuBooks(),
+      begin: async (p) => this.beginPending(p),
+      lease: async (id, owner, exp) => { this.leasePending(id, owner, exp); },
+      commit: async (o) => { this.commitPending(o); },
+      abort: async (id) => { this.abortPending(id); },
+      lose: async (o) => { this.losePending(o); },
+      noteSigned: async (amount, marks) => { this.noteSignedPending(amount, marks); },
+    };
+  }
+}
+
+export interface AttackfeeDoStub {
+  firstUse(key: string, ttl_s: number): Promise<boolean>;
+  consume(key: string, initial: number, ttl_s: number): Promise<number>;
+  peek(key: string): Promise<number | null>;
+  setTag(key: string, tag: string, ttl_s: number): Promise<void>;
+  getTag(key: string): Promise<string | null>;
+  consumeTagged(useKey: string, initial: number, ttl_s: number, tagKey: string): Promise<{ remaining: number; tag: string | null }>;
+  windowHit(key: string, window_s: number): Promise<number>;
+  windowCount(key: string, window_s: number): Promise<number>;
+  note(kind: string, test?: boolean): Promise<StoreCounts>;
+  noteCounters(delta: DailyCounters, test?: boolean): Promise<StoreCounts>;
+  daily(n: number): Promise<{ days: DailyDay[] }>;
+  counts(): Promise<StoreCounts>;
+  cashuRead(): Promise<ProofSnapshot>;
+  cashuBooks(): Promise<CashuBooks>;
+  cashuBegin(p: PendingSwap): Promise<{ ok: true; pending: PendingSwap } | { ok: false; error: "replay" }>;
+  cashuLease(id: string, owner: string, exp: number): Promise<{ ok: true }>;
+  cashuCommit(o: { id: string; proofs: StoredProof[]; marks: string[] }): Promise<{ ok: true } | { ok: false; error: "store_unavailable" }>;
+  cashuAbort(id: string): Promise<{ ok: true }>;
+  cashuLose(o: { id: string; marks: string[] }): Promise<{ ok: true }>;
+  cashuNoteSigned(amount: number, marks: string[]): Promise<{ ok: true }>;
+  cashuRecover(): Promise<{ ok: true }>;
+  ownerBooks(): Promise<OwnerBooks>;
+  withdrawStoredAt(mint: string): Promise<number>;
+  withdrawReserve(o: { quote: string; mint: string; amount: number; feeReserve: number; ppk: Record<string, number>; outputs: PendingOutput[]; maxInputs: number }): Promise<ReserveResult>;
+  withdrawGet(quote: string): Promise<WithdrawRow | null>;
+  withdrawFinish(o: { quote: string; change: StoredProof[] }): Promise<{ amount: number; fee: number; change: number } | null>;
+  withdrawRelease(quote: string, minAgeS?: number): Promise<boolean>;
+  withdrawRecheckable(withinS: number): Promise<string[]>;
+  holdCheck(thresholdMsat: number): Promise<{ available_msat: number; over: boolean; alert: boolean }>;
+  mintQuoteSweep(o?: { batch?: number; budgetMs?: number }): Promise<SweepSummary>;
+  mintQuoteSeed(o: { quote: string; action: string; amount: number; mint: string; ageS: number; open?: boolean; loss?: string }): Promise<{ ok: boolean }>;
+  reserveMintQuote(row: { quote: string; action: string; amount: number; mint: string; outputs?: { amount: number; id: string; secret: string; r: string; B_: string }[] }): Promise<boolean>;
+  claimOpenMintQuote(quote: string): Promise<{ amount: number; id: string; secret: string; r: string; B_: string }[] | null>;
+  releaseMintQuote(quote: string): Promise<boolean>;
+  unlockMintQuote(quote: string): Promise<void>;
+  finishMintQuote(row: { quote: string; proofs: { amount: number; secret: string; id: string; C: string }[] }): Promise<boolean>;
+  claimMintQuote(row: { quote: string; action: string; amount: number; mint: string; proofs: { amount: number; secret: string; id: string; C: string }[] }): Promise<boolean>;
+  hasMintQuote(quote: string): Promise<boolean>;
+  noteMintQuoteLoss(o: { quote: string; action: string; amount: number; reason?: string; mint?: string }): Promise<void>;
+}
+
+/**
+ * Worker-side AttackfeeStore over one Durable Object stub. Each method is one RPC.
+ * Fails closed on any error, and when this request's fail slot is set.
+ */
+/** ProofStore over the one AttackfeeStoreDO instance. Each call is one RPC, so writes cannot race across isolates. */
+export class DurableProofStore implements ProofStore {
+  private stub: AttackfeeDoStub;
+  constructor(stub: AttackfeeDoStub) { this.stub = stub; }
+  async read() {
+    if (storeFailSlot.getStore() === true) throw new AttackfeeError("store_unavailable");
+    return this.stub.cashuRead();
+  }
+  async books() {
+    if (storeFailSlot.getStore() === true) throw new AttackfeeError("store_unavailable");
+    return this.stub.cashuBooks();
+  }
+  async begin(p: PendingSwap) {
+    if (storeFailSlot.getStore() === true) throw new AttackfeeError("store_unavailable");
+    const r = await this.stub.cashuBegin(p);
+    if (!r.ok) throw new AttackfeeError(r.error);
+    return r.pending;
+  }
+  async lease(id: string, owner: string, exp: number) {
+    if (storeFailSlot.getStore() === true) throw new AttackfeeError("store_unavailable");
+    await this.stub.cashuLease(id, owner, exp);
+  }
+  async commit(o: { id: string; proofs: StoredProof[]; marks: string[] }) {
+    if (storeFailSlot.getStore() === true) throw new AttackfeeError("store_unavailable");
+    // CASHU_GUARD grant-only-stored: a test fault drops the write. The engine then refuses the gate.
+    if (cashuFaultSlot.getStore() === "drop-commit") return;
+    const r = await this.stub.cashuCommit(o);
+    if (!r.ok) throw new AttackfeeError(r.error);
+  }
+  async abort(id: string) {
+    if (storeFailSlot.getStore() === true) throw new AttackfeeError("store_unavailable");
+    await this.stub.cashuAbort(id);
+  }
+  async lose(o: { id: string; marks: string[] }) {
+    if (storeFailSlot.getStore() === true) throw new AttackfeeError("store_unavailable");
+    await this.stub.cashuLose(o);
+  }
+  async noteSigned(amount: number, marks: string[]) {
+    if (storeFailSlot.getStore() === true) throw new AttackfeeError("store_unavailable");
+    await this.stub.cashuNoteSigned(amount, marks);
+  }
+  recover() { return this.stub.cashuRecover(); }
+}
+
+export class DurableObjectStore implements AttackfeeStore {
+  private stub: AttackfeeDoStub;
+  constructor(stub: AttackfeeDoStub) {
+    this.stub = stub;
+  }
+  private async run<T>(f: () => Promise<T>): Promise<T> {
+    if (storeFailSlot.getStore() === true) throw new AttackfeeError("store_unavailable");
+    try {
+      return await f();
+    } catch (e) {
+      if (e instanceof AttackfeeError) throw e;
+      const err = e as Error;
+      console.log(JSON.stringify({ event: "store_error", name: err?.name, message: err?.message }));
+      throw new AttackfeeError("store_unavailable");
+    }
+  }
+  firstUse(key: string, ttl_s: number) { return this.run(() => this.stub.firstUse(key, ttl_s)); }
+  consume(key: string, initial: number, ttl_s: number) { return this.run(() => this.stub.consume(key, initial, ttl_s)); }
+  peek(key: string) { return this.run(async () => (await this.stub.peek(key)) ?? undefined); }
+  setTag(key: string, tag: string, ttl_s: number) { return this.run(() => this.stub.setTag(key, tag, ttl_s)); }
+  getTag(key: string) { return this.run(async () => (await this.stub.getTag(key)) ?? undefined); }
+  consumeTagged(useKey: string, initial: number, ttl_s: number, tagKey: string) {
+    return this.run(async () => {
+      const r = await this.stub.consumeTagged(useKey, initial, ttl_s, tagKey);
+      return { remaining: r.remaining, tag: r.tag ?? undefined };
+    });
+  }
+  windowHit(key: string, window_s: number) { return this.run(() => this.stub.windowHit(key, window_s)); }
+  windowCount(key: string, window_s: number) { return this.run(() => this.stub.windowCount(key, window_s)); }
+  note(kind: "accepted" | "rejected", test = false) { return this.run(async () => { await this.stub.note(kind, test); }); }
+  noteCounters(delta: DailyCounters, test = false) { return this.run(async () => { await this.stub.noteCounters(delta, test); }); }
+  daily(n: number) { return this.run(() => this.stub.daily(n)); }
+  reserveMintQuote(row: { quote: string; action: string; amount: number; mint: string; outputs?: { amount: number; id: string; secret: string; r: string; B_: string }[] }) {
+    return this.run(() => this.stub.reserveMintQuote(row));
+  }
+  claimOpenMintQuote(quote: string) { return this.run(() => this.stub.claimOpenMintQuote(quote)); }
+  releaseMintQuote(quote: string) { return this.run(() => this.stub.releaseMintQuote(quote)); }
+  unlockMintQuote(quote: string) { return this.run(() => this.stub.unlockMintQuote(quote)); }
+  finishMintQuote(row: { quote: string; proofs: { amount: number; secret: string; id: string; C: string }[] }) {
+    return this.run(() => this.stub.finishMintQuote(row));
+  }
+  claimMintQuote(row: { quote: string; action: string; amount: number; mint: string; proofs: { amount: number; secret: string; id: string; C: string }[] }) {
+    return this.run(() => this.stub.claimMintQuote(row));
+  }
+  hasMintQuote(quote: string) { return this.run(() => this.stub.hasMintQuote(quote)); }
+  noteMintQuoteLoss(o: { quote: string; action: string; amount: number; reason?: string; mint?: string }) { return this.run(async () => { await this.stub.noteMintQuoteLoss(o); }); }
+  counts() { return this.run(() => this.stub.counts()); }
+}

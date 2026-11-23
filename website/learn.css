@@ -1,0 +1,13 @@
+/* Breadcrumbs, related links, and hub lists for /learn. site.css and docs.css still apply. */
+nav.crumbs{display:block;margin:0 0 18px;font-size:15px;line-height:1.4}
+nav.crumbs ol{display:flex;flex-wrap:wrap;align-items:center;list-style:none;margin:0;padding:0;max-width:100%}
+nav.crumbs li{display:flex;align-items:center;margin:0;max-width:100%}
+nav.crumbs li+li:before{content:"/";margin:0 .45rem;color:var(--af-steel)}
+nav.crumbs a,nav.crumbs span{display:inline-flex;align-items:center;min-height:24px;padding:2px 0;overflow-wrap:anywhere}
+nav.crumbs a{color:var(--af-read)}
+nav.crumbs a[aria-current=page]{color:var(--af-ink);border-bottom-color:transparent}
+nav.related{display:block;margin-top:32px}
+nav.related ul{max-width:100%}
+main li{overflow-wrap:anywhere}
+/* A heading can be one long path, such as /.well-known/attackfee.json. Wrap it inside the phone width. */
+h1,h2,h3{overflow-wrap:anywhere}

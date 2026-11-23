@@ -1,0 +1,27 @@
+{
+  "name": "@attackfee/widget",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/lukecarriere/attackfee.git", "directory": "packages/widget" },
+  "homepage": "https://attackfee.dev/docs",
+  "bugs": { "url": "https://github.com/lukecarriere/attackfee/issues" },
+  "type": "module",
+  "description": "The background check that puts a small cost on each form post. Self-hosted page script and workers.",
+  "keywords": ["security", "abuse-prevention", "forms", "login", "proof-of-work", "attackfee"],
+  "engines": { "node": ">=22.18" },
+  "exports": {
+    ".": {
+      "types": "./dist/types/files.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./attackfee.js": "./dist/attackfee.js",
+    "./attackfee.worker.js": "./dist/attackfee.worker.js",
+    "./attackfee.worker-argon2id.js": "./dist/attackfee.worker-argon2id.js"
+  },
+  "types": "./dist/types/files.d.ts",
+  "files": ["dist", "README.md", "LICENSE"],
+  "publishConfig": { "access": "public", "provenance": true },
+  "devDependencies": {
+    "altcha": "3.2.3"
+  }
+}

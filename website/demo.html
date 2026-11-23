@@ -1,0 +1,28 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Demo: one form that answers 200, 403 or 402 · Attackfee</title><meta name="description" content="A protected contact form on attackfee.dev. Send it like a person and it goes through. Send it like a script and it gets a 403."><link rel="icon" href="/favicon.ico" sizes="32x32"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><link rel="stylesheet" href="/site.css"><link rel="stylesheet" href="/demo.css"></head><body>
+<header><div class="bar"><span class="brand"><a class="mark" href="/">Attackfee<i aria-hidden="true"></i></a><span class="tag">Demo</span></span><nav aria-label="Pages"><a href="/#how">How it works</a><a href="/#agents">For agents</a><a href="/#limits">Limits</a><a href="/demo" aria-current="page">Demo</a><a href="/docs">Docs</a><a href="/learn">Learn</a></nav></div></header>
+<main><h1>Try to get a write through</h1>
+<p>The form below is protected the same way your comment box or signup form would be. Fill it in and press Send. The check runs in the background while you type, and the send goes through. Then call the same endpoint the way a script would, with no pass, and watch the server refuse it.</p>
+<div class="demo">
+<section class="card" id="contact" aria-labelledby="c-h"><h2 id="c-h">Contact</h2><p class="sub">Protected as a write.</p>
+<form method="post" action="/demo/contact" data-attackfee="write"><div class="row2"><div><label for="n">Name</label><input id="n" name="name" value="Ana Ruiz" autocomplete="name"></div><div><label for="e">Email</label><input id="e" name="email" type="email" value="ana@example.com" autocomplete="email"></div></div>
+<label for="m">Message</label><textarea id="m" name="message">Hi, is the workshop on Saturday still on?</textarea>
+<button class="b" type="submit">Send</button><noscript><p>This form needs JavaScript.</p></noscript></form>
+<p class="res"><span class="pill ok" role="status" id="sent" hidden>Accepted · 200</span></p></section>
+<section class="card" id="nopass" aria-labelledby="x-h"><h2 id="x-h">Without a pass</h2><p class="sub">The same endpoint, called with no pass. This is what an automated client gets on its first try.</p>
+<pre tabindex="0"><span class="g">$</span> curl -X POST https://attackfee.dev/demo/contact -d "message=hi"
+<span class="r">403</span>  {"error": "attackfee_required", "challenge": { ... }}</pre>
+<div class="res"><button class="b sec" type="button" id="nopass-btn">Send without a pass</button><span class="pill bad" role="status" id="nopass-out" hidden>Rejected · 403</span></div></section>
+<section class="card" id="agent" aria-labelledby="a-h"><h2 id="a-h">As an AI agent</h2><p class="sub">Send the same request with the Attackfee-Client: agent header and the server answers 402 with a price and a link to a work challenge. The agent can pay for one write or do the work and earn a pass for 20. A write costs under a cent; current prices are at <code>/v1/price</code>.</p>
+<pre tabindex="0"><span class="g">$</span> curl -X POST https://attackfee.dev/demo/contact -H "Attackfee-Client: agent" -d "message=hi"
+<span class="r">402</span>  {"error": "payment_required", "challenge_url": "/v1/challenge?...", ... }</pre></section>
+<aside class="stats" aria-labelledby="st-h"><div class="card"><h2 id="st-h">Today on this demo</h2>
+<dl class="kv"><dt>Accepted</dt><dd id="st-acc">0</dd><dt>Refused</dt><dd id="st-rej">0</dd></dl>
+<p class="note">Plain counts of today's sends (UTC days), with no personal data. The daily totals are public at <code>/demo/stats/daily</code>.</p>
+</div></aside>
+</div>
+<p class="fine">This demo checks writes only. A browser earns a pass with background work. An automated client can pay over HTTP 402 or do the same work. What you type is checked and then thrown away: it is never stored, echoed, emailed or logged.</p>
+<section class="local" aria-labelledby="l-h"><h2 id="l-h">Run the full demo on your own machine</h2>
+<p>The local demo has more forms, a load test and the paid agent path against a test backend. It ships with the source code.</p>
+</section>
+</main><footer class="site-foot"><nav aria-label="Site"><a href="/privacy">Privacy</a><a href="/terms">Terms</a><a href="/support">Support</a><a href="/download">Download</a></nav><p>Attackfee runs on your own server. This site has no analytics and no tracking scripts.</p></footer><script src="/attackfee/v1/attackfee.js" defer></script><script src="/demo.js" defer></script></body></html>

@@ -1,0 +1,29 @@
+/* Settings → Attackfee. Only the balance box, the Advanced panel and the show/hide rules
+   (design/proto/wp-settings.html); everything else is core WordPress admin styling. */
+.attackfee-root .attackfee-lede{font-size:14px;margin:4px 0 12px;max-width:42em}
+.attackfee-root .attackfee-stat{color:#50575e;margin:0 0 8px}
+.attackfee-root .attackfee-stat a{margin-left:4px}
+.attackfee-root .attackfee-export-help{margin-top:-4px}
+.attackfee-root .attackfee-muted{color:#646970}
+.attackfee-root .attackfee-top{margin:12px 0}
+.attackfee-root .attackfee-top p{margin:.5em 0}
+.attackfee-root .notice.inline p{margin:.25em 0}
+.attackfee-root .notice.inline{display:inline-block;margin:8px 0 0;padding:6px 12px}
+.attackfee-bal{display:inline-block;background:#fff;border:1px solid #c3c4c7;border-radius:4px;padding:12px 16px;min-width:260px}
+.attackfee-bal strong{display:block;font-size:24px;line-height:1.2;font-weight:600}
+.attackfee-bal span{color:#50575e;font-size:13px}
+details.attackfee-adv{margin-top:28px;background:#fff;border:1px solid #c3c4c7;border-radius:4px;max-width:900px}
+details.attackfee-adv>summary{cursor:pointer;padding:12px 16px;font-size:14px;font-weight:600;list-style:revert}
+details.attackfee-adv>summary .attackfee-muted{font-weight:400;margin-left:6px}
+details.attackfee-adv .attackfee-in{padding:0 16px 8px;border-top:1px solid #f0f0f1}
+.attackfee-root textarea.large-text{max-width:32em}
+.attackfee-root:not(.payouts) .needs-payouts{display:none}
+.attackfee-root:not(.server) .needs-server{display:none}
+.attackfee-root.server .test-only{display:none}
+.attackfee-root:not(.noaddr) .needs-noaddr{display:none}
+.attackfee-root.noaddr .has-addr{display:none}
+.attackfee-root:not(.down) .needs-down{display:none}
+.attackfee-root.down .not-down{display:none}
+/* Monospace fields: with WordPress's default line-height the underscore in "site_…" falls just below
+   the text box and is clipped at 1x. A taller line keeps descenders inside the 40 px field. */
+.attackfee-root input.code { line-height: 2; }

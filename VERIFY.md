@@ -1,0 +1,90 @@
+# Verifying Attackfee
+
+A verifier runs a script and reads PASS, FAIL, or KNOWN. The scripts do not deploy, publish, or change DNS.
+
+## Pull request
+
+Start from a clean checkout. You need Node 22, Node 24, PHP 8.1 or newer, Composer, and a full git history. `NODE_22` and `NODE_24` are optional absolute paths to those binaries. The gate uses the variable when it is set, then walks every `PATH` entry for `node22`/`node24` and for `node` of that major (so an earlier Node 22 does not hide a later Node 24), then `~/.local/node-v<major>*`, `~/.local/node/node-v<major>*`, `/usr/local/node-v<major>*`, `~/.local/node<major>` and `/usr/local/node<major>` (for example `~/.local/node24`), then the highest `v<major>.*` under `${NVM_DIR:-$HOME/.nvm}/versions/node`. `scripts/node-path.sh --export` prints those `NODE_22` and `NODE_24` assignments for `eval`; `deploy.sh` runs that before the verify gate. `~/.local/bin` is appended to `PATH` so a php or node you already chose stays first. gitleaks is installed there when it is not already on `PATH`.
+
+```sh
+bash scripts/verify-attackfee.sh --ref <pr-sha> --base <base-sha>
+```
+
+That is the pre-merge gate: install, build, typecheck, lints, the Node tests on Node 22 and Node 24, the PHP tests, the `scripts/mutate-*.mjs` scripts, a gitleaks scan of `<base-sha>..<pr-sha>`, and a base proof. The base proof runs the pull request's new test files against the base commit. Each of those files has to fail there.
+
+Evidence lands in `.verify-attackfee/<stamp>-<sha>/` (gitignored): one log per step and `SUMMARY.md`. The process exits 0 only when the overall line is PASS. KNOWN and SKIP do not fail the run.
+
+PHP without `sodium_crypto_pwhash` cannot run Argon2id. `run-vectors` is then KNOWN only when every `FAIL` line is an Argon2id or sodium vector and the `ok`, `FAIL`, and `SKIP` lines add up to the summary that runner printed (`passed`, `failed`, and `skipped`). A no-sodium box reports 32 passed and 1 failed; a count of 33 passed and 1 failed is the same known miss. `run-vectors.php` prints the engine-secret check before it resets the counters, so the lines may total one more than the summary. Any other `FAIL` line is FAIL. `run-issuer` is KNOWN when it stops on `ext-sodium is required for Argon2id.` and prints no `FAIL` line. With sodium, both runners have to exit 0. `ATTACKFEE_VERIFY_SODIUM=0` forces that classification. The mutant scripts run on Node 22 and request the TAP reporter, because Node 24's default reporter does not print `# fail`. `npx playwright install --with-deps` is optional: if apt fails, the gate installs the browser without system packages, and the install step fails only when that browser install fails too.
+
+`--only lint,test` runs those steps alone. The tree needs `npm ci` and a build before `test` or `typecheck`.
+
+This gate does not call a live mint and does not spend. It does not run `scripts/live-checks.sh` or `scripts/l402-live-check.sh`.
+
+## After a deploy
+
+Someone who may deploy publishes with the commit in the message:
+
+```sh
+npx wrangler deploy --message <sha>
+```
+
+Then:
+
+```sh
+bash scripts/release-check.sh --commit <sha> --version <worker-version-id>
+```
+
+It runs the free live checks, reads `wrangler deployments status` and `wrangler versions list` for `attackfee-site`, and checks that the live version id is `<worker-version-id>` and that the deploy message names `<sha>`. It prints `npx wrangler rollback <previous-version-id>` and does not run it. Wrangler has to be logged in to the account that owns the Worker. The free checks talk to the live origin you pass; the script default is `https://attackfee.dev`.
+
+## Live checks
+
+```sh
+bash scripts/live-checks.sh
+```
+
+Free and read-only: `GET /v1/health`, `GET /v1/price?action=write`, `POST /demo/contact` (403 without an agent header, 402 with `attackfee-client: agent`), and `GET /demo/stats` with exactly `accepted`, `rejected`, `reversals`, and `reversed_sats`.
+
+Real ecash is separate and spends:
+
+```sh
+bash scripts/live-checks.sh --spend 20 --proofs "$ATTACKFEE_PROOFS" --wallet "$ATTACKFEE_WALLET"
+```
+
+`--spend 20` is the cap for the two paid checks (10 each). The wallet module exports `wallet()`, `norm`, and `MINT`. The proofs file is the path you pass. The script never prints a token, a proof, or a secret. A spend run writes `.state.json` mode 0600 in the out dir; do not publish that directory. `scripts/tail-redact.py` and `scripts/tail-summary.py` redact a `wrangler tail --format json` capture. `scripts/check-live-state.sh` is the older free check and remains covered by its test.
+
+## Agent manifest, llms.txt, and gitleaks
+
+```sh
+bash scripts/check-open-intelligence.sh
+```
+
+Read-only against the live origin (default `https://attackfee.dev`): `GET /.well-known/attackfee.json` returns 200 and valid JSON, `GET /llms.txt` returns 200 with a `text/plain` content type, an unpaid `POST /demo/contact` with `attackfee-client: agent` returns 402 with an `X-Cashu` header when Cashu receive is configured, and gitleaks reports no leaks in this checkout. The production `attackfee-site` Worker is payments-on (Minibits mint allowlist, L402 on, no NWC, no committed secrets), so that 402 probe is expected to pass against production after a payments-on deploy. The script does not pay and does not print the `X-Cashu` value. `bash scripts/check-open-intelligence.sh --self-check` proves each check can fail.
+
+## Live pages after a deploy
+
+```sh
+bash scripts/check-live-pages.sh
+bash scripts/check-live-pages.sh --path /docs/ask --contains "the phrase you just shipped"
+```
+
+Default is every `loc` in `/sitemap.xml` (HTTP 200 with an HTML title), plus `/robots.txt`, `/sitemap.xml`, `/llms.txt`, and `/.well-known/attackfee.json`. `--path` adds a page; later `--contains` phrases apply to that path. It does not follow redirects, does not pay, and does not print a token or secret. `bash scripts/check-live-pages.sh --self-check` proves each check can fail.
+
+## www redirect
+
+```sh
+bash scripts/check-www-redirect.sh
+```
+
+Confirms `www.<apex>` returns 308 to the apex and keeps the path and query. Default apex is `https://attackfee.dev`; default paths are `/` and `/docs/ask?q=1`. It does not follow the redirect, does not pay, and does not print a token or secret. `bash scripts/check-www-redirect.sh --self-check` proves each check can fail.
+
+## Still done by hand
+
+- A visual pass and browser screenshots. Phone width is asserted in `tests/viewport.test.ts`; a screenshot is not.
+- The WordPress admin UI. The plugin zip is checked by `npm test`. A live admin at `http://127.0.0.1:8888` is optional.
+- `scripts/live-checks.sh --spend` and `scripts/l402-live-check.sh`. Both spend. They are not part of the pre-merge gate.
+- The deploy itself, and the Cloudflare login `release-check.sh` uses to read the Worker version.
+- Starting `wrangler tail`. The redact helpers are in `scripts/`; the tail is not started for you.
+
+## CI
+
+`.github/workflows/ci.yml` runs `scripts/verify-attackfee.sh --only gitleaks` on pull requests and on `main`. On a pull request the scan is the base commit through the head. On `main` it is the pushed range. A local run with no `--base` scans the one commit under test. The test job already runs the Node 22 suite, PHP with sodium, and the mutant scripts. The rest of `verify-attackfee.sh` (Node 24, the base proof, and a second install) stays a verifier command.

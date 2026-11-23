@@ -1,0 +1,40 @@
+# Demo issuer config (spec §14). The secret comes from the environment; the demo makes a
+# random one for the run if ATTACKFEE_SECRET is not set.
+site_id: site_demo
+secret: env:ATTACKFEE_SECRET
+issuer_public_url: http://localhost:8787
+allowed_origins: [http://localhost:8787, http://127.0.0.1:8787]
+defaults:
+  pass_ttl_s: 900
+  pass_uses: 20
+  challenge_ttl_s: 120
+  max_solve_ms: 8000
+adaptive:
+  velocity: false        # phase 3 turns velocity on
+rate_limit:
+  # Default is 60/min per IP. The demo allows 300 so the bot hammer (about 100 challenges
+  # per run of both buttons) can be re-run without waiting a minute.
+  challenge_per_min: 300
+routes:
+  - { prefix: "/", class: read }          # explicit: page views stay free (Amendment 2)
+  - { prefix: "/contact", class: write }
+  - { prefix: "/comments", class: write }
+  - { prefix: "/search", class: search }
+# Paid requests (phase 2) on the local test backend: no network, no real money. Agents that send
+# `Attackfee-Client: agent` (or ?client=agent) get a 402 with an offer; everyone else keeps the
+# invisible check. Settle passes are one use, 60 seconds (docs/settlement.md Q6).
+settlement:
+  enabled: true
+  backend: stub          # local test backend only in this build
+  fee_bps: 1000          # 10% platform fee, rounded down per payment, held until phase 4
+  pass_uses: 1
+  pass_ttl_s: 60
+  offer_ttl_s: 120
+  # Owner API for a local WordPress site with "Payment server" (http://127.0.0.1:8787). The demo
+  # keeps the key in demo/.owner-key (gitignored) unless ATTACKFEE_OWNER_KEY is set.
+  owner_key: env:ATTACKFEE_OWNER_KEY
+  fx:
+    # FIXED TEST RATE for the demo, not a market price: 100000 USD per unit makes a write
+    # (10,000 msat) show as $0.01. A live, free, commercial-use rate source is still to be chosen.
+    source: fixed
+    usd_per_btc: 100000

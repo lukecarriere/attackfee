@@ -1,0 +1,149 @@
+// Visitor guides (issues #8 and #9): quick start, widget, server, agent SDK, MCP, WordPress,
+// self-hosting, and the download page. Linked from the homepage nav. The Pay with NWC guide is kept in
+// docs/ for the repo only; the site does not serve it.
+import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync, existsSync, mkdtempSync } from "node:fs";
+import { createServer, type Server } from "node:http";
+import { tmpdir } from "node:os";
+import { join, extname } from "node:path";
+import { chromium } from "playwright";
+// @ts-ignore plain JS build script
+import { build, DOC_PAGES, GUIDE_PAGES, ICON_TAGS, pagePath, pluginRelease, parseGuide } from "../website/build.mjs";
+// @ts-ignore plain JS helper
+import { lintText, lintVendor } from "../scripts/copy-lib.mjs";
+
+const ROOT = new URL("..", import.meta.url).pathname;
+const OUT = build(mkdtempSync(join(tmpdir(), "attackfee-docs-")) + "/", "");
+const SET = build(mkdtempSync(join(tmpdir(), "attackfee-docs-set-")) + "/", "https://site.example", () => {});
+const rel = pluginRelease();
+const hrefs = (h: string) => [...h.matchAll(/\shref="([^"]*)"/gi)].map((m) => m[1]);
+const decode = (s: string) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&amp;/g, "&");
+
+test("guides: one h1, the copy.md description, icons, docs.css, no script, no .html href", () => {
+  assert.equal(DOC_PAGES.length, 10);
+  assert.deepEqual(GUIDE_PAGES.map((p: { file: string }) => p.file), DOC_PAGES.map((p: { file: string }) => p.file).filter((f: string) => f !== "docs/index"));
+  for (const p of DOC_PAGES) {
+    const h = readFileSync(OUT + p.file + ".html", "utf8");
+    const md = readFileSync(ROOT + "website/" + p.file + ".md", "utf8").replace(/\r\n/g, "\n");
+    const title = /^# (.+)$/m.exec(md)![1].replaceAll("{{VERSION}}", rel.version);
+    assert.match(h, new RegExp("<h1>" + title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "</h1>"), p.file);
+    assert.equal([...h.matchAll(/<h1>/g)].length, 1, p.file);
+    assert.ok(h.includes(ICON_TAGS), p.file);
+    assert.ok(h.includes('<link rel="stylesheet" href="/docs.css">'), p.file);
+    assert.ok(h.includes('<link rel="stylesheet" href="/site.css">'), p.file);
+    assert.doesNotMatch(h, /<script|<style|\sstyle=|\son[a-z]+\s*=|javascript:/i, p.file);
+    assert.doesNotMatch(h, /\{\{VERSION\}\}|\{\{SHA\}\}/, p.file + ": tokens replaced");
+    const nav = /<nav class="guides" aria-label="Guides">([\s\S]*?)<\/nav>/.exec(h)![1];
+    const current = [...nav.matchAll(/href="([^"]+)" aria-current="page"/g)].map((m) => m[1]);
+    assert.deepEqual(current, p.file === "docs/index" ? [] : [pagePath(p.file)], p.file);
+    for (const u of hrefs(h)) {
+      assert.doesNotMatch(u, /\.html?(?:$|[?#])/i, p.file + " " + u);
+      if (u.startsWith("/")) assert.match(u, /^\/(?!\/)/, u);
+    }
+    assert.deepEqual([...lintText("website/dist/" + p.file + ".html", h), ...lintVendor("website/dist/" + p.file + ".html", h)], [], p.file);
+  }
+  const home = readFileSync(OUT + "index.html", "utf8");
+  assert.match(home, /<a href="\/docs">Docs<\/a><a href="\/learn">Learn<\/a>/);
+});
+
+test("guides: canonicals point at the extensionless path, and only when a site root is set", () => {
+  for (const p of DOC_PAGES) {
+    assert.equal([...readFileSync(OUT + p.file + ".html", "utf8").matchAll(/rel="canonical"/g)].length, 0, p.file);
+    const set = readFileSync(SET + p.file + ".html", "utf8");
+    assert.match(set, new RegExp(`<link rel="canonical" href="https://site\\.example${pagePath(p.file)}">`), p.file);
+    const abs = hrefs(set).filter((u) => /^https?:/i.test(u));
+    assert.deepEqual(abs, ["https://site.example" + pagePath(p.file)], p.file + ": the canonical is the only absolute href");
+  }
+});
+
+test("download and WordPress pages link the GPL plugin zip", () => {
+  const zip = "/download/" + rel.zip;
+  const sha = zip + ".sha256";
+  for (const file of ["download/index.html", "docs/wordpress.html"]) {
+    const h = readFileSync(OUT + file, "utf8");
+    assert.ok(h.includes(`href="${zip}"`), file);
+    assert.ok(h.includes(`href="${sha}"`), file);
+    assert.match(h, /GPL-2\.0-or-later/);
+  }
+  const page = readFileSync(OUT + "download/index.html", "utf8");
+  assert.match(page, new RegExp("<h1>Download</h1>"));
+  assert.match(decode(page), new RegExp("Version " + rel.version.replace(/\./g, "\\.")));
+  if (existsSync(OUT + "download/" + rel.shaName)) {
+    const hex = readFileSync(OUT + "download/" + rel.shaName, "utf8").trim().split(/\s+/)[0];
+    assert.match(page, new RegExp("<pre tabindex=\"0\"><code>" + hex + "</code></pre>"));
+  }
+});
+
+let server: Server;
+let base = "";
+const TYPES: Record<string, string> = { html: "text/html; charset=utf-8", css: "text/css", woff2: "font/woff2", png: "image/png", ico: "image/x-icon", svg: "image/svg+xml", jpg: "image/jpeg" };
+
+before(async () => {
+  server = createServer((req, res) => {
+    let path = (req.url ?? "/").split("?")[0];
+    if (path.endsWith("/")) path = path.slice(0, -1);
+    let file = path === "" ? "index.html" : path.replace(/^\//, "");
+    if (!extname(file)) file = file === "docs" || file === "download" ? file + "/index.html" : file + ".html";
+    if (file.includes("..") || !existsSync(OUT + file)) { res.writeHead(404).end(); return; }
+    const ext = extname(file).slice(1);
+    res.writeHead(200, { "content-type": TYPES[ext] ?? "application/octet-stream", "content-security-policy": "default-src 'none'; style-src 'self'; img-src 'self'; font-src 'self'" }).end(readFileSync(OUT + file));
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  base = `http://127.0.0.1:${(server.address() as any).port}`;
+});
+after(() => server?.close());
+
+test("guides in a browser: 200, same-origin, no sideways scroll at phone width", async () => {
+  const browser = await chromium.launch();
+  try {
+    for (const width of [390, 320, 1280]) {
+      const ctx = await browser.newContext({ viewport: { width, height: width > 760 ? 800 : 844 } });
+      const page = await ctx.newPage();
+      const problems: string[] = [];
+      page.on("console", (m) => { if (/Content.Security.Policy|Refused to/i.test(m.text())) problems.push(m.text()); });
+      for (const p of DOC_PAGES) {
+        const seen: string[] = [];
+        const onReq = (r: { url: () => string }) => seen.push(r.url());
+        page.on("request", onReq);
+        const res = await page.goto(base + pagePath(p.file), { waitUntil: "networkidle" });
+        assert.equal(res!.status(), 200, p.file + " " + width);
+        await page.evaluate(() => document.fonts.ready);
+        assert.equal(await page.evaluate(() => document.scripts.length), 0, p.file);
+        assert.equal(await page.locator("h1").innerText(), /^# (.+)$/m.exec(readFileSync(ROOT + "website/" + p.file + ".md", "utf8"))![1].replaceAll("{{VERSION}}", rel.version), p.file);
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, `${p.file} ${width}: no sideways scroll`);
+        for (const u of seen) assert.ok(u.startsWith(base), `${p.file} ${width}: ${u}`);
+        page.off("request", onReq);
+      }
+      assert.deepEqual(problems, [], width + ": CSP");
+      await ctx.close();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test("guides: a pipe table renders as a table with one header row, and a broken one fails the build", () => {
+  const g = parseGuide("# T\n\n| You ask | Your agent calls |\n|---|---|\n| Is it up? | `GET /v1/health` |\n| Cost? | `GET /v1/price` |\n");
+  assert.deepEqual(g.blocks, [{ table: { head: ["You ask", "Your agent calls"], rows: [["Is it up?", "`GET /v1/health`"], ["Cost?", "`GET /v1/price`"]] } }]);
+  assert.throws(() => parseGuide("# T\n\n| a | b |\n| c | d |\n"), /table/);
+  assert.throws(() => parseGuide("# T\n\n| a | b |\n|---|---|\n| c |\n"), /table/);
+  const h = readFileSync(OUT + "docs/ask.html", "utf8");
+  assert.match(h, /<table>\s*<thead><tr><th>You ask<\/th><th>Your agent calls<\/th><\/tr><\/thead>/);
+  assert.match(h, /<td><code>GET \/\.well-known\/attackfee\.json<\/code><\/td>/);
+  assert.match(h, /The current USD price is at that endpoint\. An automated client can pay over HTTP 402 or do the background work\./);
+  assert.doesNotMatch(h, /payment_required|cashu|BOLT11|no hosted/i, "rail names stay off the public ask guide");
+  assert.match(h, /<code>rate_limited<\/code>\. Wait for <code>retry-after<\/code> \(60 s\)/);
+  assert.match(h, /Siteverify says <code>timeout-or-duplicate<\/code>/);
+  assert.equal([...h.matchAll(/<tr>/g)].length, 22, "header plus 21 rows");
+});
+
+test("Pay with NWC guide stays in the repo with the capped fetch command, and the site does not serve it", () => {
+  const cmd = "npx @getalby/cli fetch \"https://YOUR-SITE/PAY-PATH\" --method POST --max-amount 10 --currency BTC --unit sats --network lightning";
+  const md = readFileSync(ROOT + "docs/pay-with-nwc.md", "utf8");
+  assert.ok(md.includes(cmd), "the guide must include the capped fetch command exactly");
+  assert.match(md, /default spend cap of 5,000/, "the guide must name the CLI default spend cap of 5,000");
+  assert.equal(existsSync(ROOT + "website/docs/pay-with-nwc.md"), false);
+  assert.equal(existsSync(OUT + "docs/pay-with-nwc.html"), false, "not built");
+  assert.ok(!DOC_PAGES.some((p: { file: string }) => p.file === "docs/pay-with-nwc"));
+});

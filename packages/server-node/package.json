@@ -1,0 +1,28 @@
+{
+  "name": "@attackfee/server",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/lukecarriere/attackfee.git", "directory": "packages/server-node" },
+  "homepage": "https://attackfee.dev/docs",
+  "bugs": { "url": "https://github.com/lukecarriere/attackfee/issues" },
+  "type": "module",
+  "description": "Issuer and verifier for Node: put a per-action cost on login, signup and write routes. HTTP API, Express middleware, fetch helper.",
+  "keywords": ["security", "abuse-prevention", "forms", "login", "express", "http-402", "proof-of-work", "attackfee"],
+  "engines": { "node": ">=22.18" },
+  "exports": {
+    ".": {
+      "types": "./dist/types/server-node/src/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/types/server-node/src/index.d.ts",
+  "files": ["dist", "README.md", "LICENSE"],
+  "publishConfig": { "access": "public", "provenance": true },
+  "dependencies": {
+    "@noble/curves": "2.4.0",
+    "altcha-lib": "2.5.0",
+    "express": "^5.1.0",
+    "hash-wasm": "4.12.0",
+    "yaml": "^2.8.0"
+  }
+}

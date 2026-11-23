@@ -1,0 +1,645 @@
+// HTTP layer: the /v1 API (spec §8.5), the protect middleware, and a fetch-aware helper.
+// Uses only node:http primitives, so it works as Express middleware and as a plain (req, res, next).
+
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { readFileSync, existsSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { type ActionClass, AttackfeeError, isActionClass, timingSafeEqual, utf8, verifyPassToken, classCovers, clientIp as resolveClientIp } from "../../protocol/src/index.ts";
+import { asCashuPayment, l402Challenge, l402Enabled, parseL402Authorization, paymentRequired, presentedCashu, quoteRetryHeaders, StubSettler } from "../../settlement-ln/src/index.ts";
+import type { Attackfee } from "./attackfee.ts";
+import { buildManifest, agentsPointer, priceBody, PAID_CLASSES } from "./manifest.ts";
+
+/** Origin of this request as the client sees it (for absolute URLs in the manifest). */
+function requestOrigin(req: Req): string {
+  const proto = (req.socket as any)?.encrypted ? "https" : "http";
+  const host = String(req.headers.host ?? "localhost").replace(/[^A-Za-z0-9.:\-\[\]]/g, "");
+  return `${proto}://${host}`;
+}
+
+export const VERSION = "1.0.0";
+export const PASS_COOKIE = "attackfee_pass";
+const MAX_BODY = 1 << 20;
+
+type Req = IncomingMessage & { body?: any; ip?: string };
+type Next = (err?: unknown) => void;
+
+function send(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
+  const json = JSON.stringify(body);
+  res.statusCode = status;
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.setHeader("cache-control", "no-store");
+  for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
+  res.end(json);
+}
+
+/**
+ * Where a request comes from (docs/adapters.md, "Client address"). `ip` is the client address for load
+ * pricing and velocity: the socket address, or behind a proxy listed in ATTACKFEE_TRUSTED_PROXIES the
+ * X-Forwarded-For walk of packages/protocol client-ip.ts; null when that walk finds no usable client
+ * (no network: base price, multiplier 1, no velocity count). `limit` is the challenge rate-limit key:
+ * the client address, else the socket address (a stricter shared bucket), else "?". Express's req.ip
+ * and its "trust proxy" setting are not used.
+ */
+export function requestClient(attackfee: Attackfee, remoteAddr: string | null | undefined, xff: string | string[] | null | undefined): { ip: string | null; limit: string } {
+  const remote = typeof remoteAddr === "string" ? remoteAddr.trim() : "";
+  const header = Array.isArray(xff) ? xff.join(", ") : xff;
+  const found = resolveClientIp({ remoteAddr: remote, xff: header, trusted: attackfee.config.trusted_proxies ?? [] });
+  const ip = found === "" ? null : found;
+  return { ip, limit: ip ?? (remote || "?") };
+}
+
+const clientOf = (attackfee: Attackfee, req: Req) => requestClient(attackfee, req.socket?.remoteAddress, req.headers["x-forwarded-for"]);
+
+export function parseCookies(header: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    const k = part.slice(0, i).trim();
+    if (k) out[k] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+
+/** Read and parse a urlencoded or JSON body once, if nothing upstream already did. */
+export async function readBody(req: Req): Promise<any> {
+  if (req.body !== undefined) return req.body;
+  const ct = String(req.headers["content-type"] ?? "").toLowerCase();
+  const isForm = ct.startsWith("application/x-www-form-urlencoded");
+  const isJson = ct.startsWith("application/json");
+  if (!isForm && !isJson) return (req.body = {});
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_BODY) throw new AttackfeeError("malformed", "body too large");
+    chunks.push(chunk as Buffer);
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  try {
+    req.body = isJson ? (text ? JSON.parse(text) : {}) : Object.fromEntries(new URLSearchParams(text));
+  } catch {
+    throw new AttackfeeError("malformed", "bad body");
+  }
+  return req.body;
+}
+
+/** Pass from `Authorization: Attackfee <pass>` (or Bearer), the `attackfee-pass` form field, or the cookie. */
+export function extractPass(req: Req, body?: any): string | undefined {
+  const auth = String(req.headers["authorization"] ?? "");
+  const m = /^(?:Attackfee|Bearer)\s+(\S+)$/i.exec(auth);
+  if (m) return m[1];
+  if (body && typeof body["attackfee-pass"] === "string" && body["attackfee-pass"]) return body["attackfee-pass"];
+  return parseCookies(req.headers.cookie as string | undefined)[PASS_COOKIE] || undefined;
+}
+
+/** An automated client (settlement.md Q2): `client=agent` in the query or a `Attackfee-Client: agent` header. */
+function isAgentRequest(query: URLSearchParams | null, header: string | null | undefined): boolean {
+  return query?.get("client") === "agent" || String(header ?? "").trim().toLowerCase() === "agent";
+}
+
+function isSecure(attackfee: Attackfee, req: Req): boolean {
+  const s = attackfee.config.cookie.secure;
+  if (s !== "auto") return s;
+  return (req.socket as any)?.encrypted === true || String(req.headers["x-forwarded-proto"] ?? "") === "https";
+}
+
+function applyCors(attackfee: Attackfee, req: Req, res: ServerResponse): void {
+  const origin = req.headers.origin;
+  if (origin && attackfee.config.allowed_origins.includes(origin)) {
+    res.setHeader("access-control-allow-origin", origin);
+    res.setHeader("access-control-allow-credentials", "true");
+    res.setHeader("vary", "Origin");
+  }
+}
+
+function statusFor(e: unknown): number {
+  if (!(e instanceof AttackfeeError)) return 500;
+  switch (e.code) {
+    case "malformed":
+    case "unsupported":
+    case "wrong_action":
+      return 400;
+    case "rate_limited":
+      return 429;
+    case "store_unavailable":
+      return 503;
+    default:
+      return 401;
+  }
+}
+
+/** Widget files. The published package ships them in dist/widget/; a source checkout uses packages/widget/dist. */
+function widgetDistDir(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const shipped = join(here, "widget");
+  if (existsSync(join(shipped, "attackfee.js"))) return shipped + "/";
+  return join(here, "..", "..", "widget", "dist") + "/";
+}
+const WIDGET_DIST = widgetDistDir();
+const assetCache = new Map<string, { mtime: number; body: Buffer }>();
+function asset(name: string): Buffer | undefined {
+  const p = WIDGET_DIST + name;
+  if (!existsSync(p)) return undefined;
+  const mtime = statSync(p).mtimeMs;
+  const hit = assetCache.get(name);
+  if (hit && hit.mtime === mtime) return hit.body;
+  const body = readFileSync(p);
+  assetCache.set(name, { mtime, body });
+  return body;
+}
+
+/** The issuer API under /v1 plus the widget files under /attackfee/v1/. */
+export function attackfeeRouter(attackfee: Attackfee) {
+  return async function router(req: Req, res: ServerResponse, next: Next) {
+    const url = new URL(req.url ?? "/", "http://x");
+    const path = url.pathname;
+    try {
+      if (path === "/attackfee/v1/attackfee.js" || path === "/attackfee/v1/attackfee.worker.js" || path === "/attackfee/v1/attackfee.worker-argon2id.js" || path === "/attackfee/v1/LICENSES.txt") {
+        const body = asset(path.slice("/attackfee/v1/".length));
+        if (!body) return send(res, 404, { error: "not_built" });
+        res.statusCode = 200;
+        res.setHeader("content-type", path.endsWith(".txt") ? "text/plain; charset=utf-8" : "text/javascript; charset=utf-8");
+        res.setHeader("cache-control", "no-cache");
+        // A dedicated worker runs under the policy of its own response. The hardened engine compiles
+        // WebAssembly, so its worker (and only its worker) gets 'wasm-unsafe-eval' and nothing else:
+        // no network, no imports. This overrides any page-wide policy the host app set for this path.
+        if (path.endsWith("attackfee.worker-argon2id.js")) res.setHeader("content-security-policy", "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'");
+        else if (path.endsWith("attackfee.worker.js")) res.setHeader("content-security-policy", "default-src 'none'; script-src 'self'");
+        return res.end(body);
+      }
+      // Agent discovery (Amendment 3): free, no pass, no challenge, no payment, any client.
+      if ((path === "/.well-known/attackfee.json" || path === "/.well-known/agents.json") && (req.method === "GET" || req.method === "HEAD")) {
+        const origin = requestOrigin(req);
+        res.setHeader("access-control-allow-origin", "*");
+        res.setHeader("cache-control", "public, max-age=60");
+        if (path === "/.well-known/agents.json") {
+          attackfee.metrics.discovery("agents_json");
+          return send(res, 200, agentsPointer(origin + "/.well-known/attackfee.json"));
+        }
+        attackfee.metrics.discovery("manifest");
+        return send(res, 200, buildManifest({ api: origin + "/v1", docs: attackfee.config.discovery.docs_url, status: attackfee.priceStatus(), prices: attackfee.priceTable(), loadPricing: attackfee.loadPricing(), methods: await attackfee.payMethods() }));
+      }
+      if (!path.startsWith("/v1/")) return next();
+      applyCors(attackfee, req, res);
+      if (req.method === "OPTIONS") {
+        res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
+        res.setHeader("access-control-allow-headers", "content-type, authorization, attackfee-client, x-cashu");
+        res.setHeader("access-control-max-age", "600");
+        res.statusCode = 204;
+        return res.end();
+      }
+
+      if (path === "/v1/health" && req.method === "GET") {
+        // "stub" is this build's extension of the spec's off | regtest | live: the local test backend.
+        if (attackfee.paid) await attackfee.paid.ensureFx();
+        const st = attackfee.paid ? await attackfee.paid.status() : null;
+        const body: Record<string, unknown> = st ? { ok: true, v: VERSION, settlement: st.mode, settlement_degraded: !st.healthy, usd_rate: st.usd } : { ok: true, v: VERSION, settlement: "off" };
+        if (String(req.headers.accept ?? "").includes("text/html")) {
+          res.statusCode = 200;
+          res.setHeader("content-type", "text/html; charset=utf-8");
+          const snap = attackfee.metrics.snapshot();
+          const rows = Object.entries({ ...body, ...snap, by_tag: JSON.stringify(snap.by_tag) }).map(([k, v]) => `<tr><th>${k}</th><td>${String(v)}</td></tr>`).join("");
+          return res.end(`<!doctype html><meta charset="utf-8"><title>Attackfee status</title><h1>Attackfee status</h1><table>${rows}</table>`);
+        }
+        return send(res, 200, body);
+      }
+
+      // Price of one paid request that applies now, load included (Amendment 3, price_write_action). Read-only: mints nothing.
+      if (path === "/v1/price" && req.method === "GET") {
+        const action = url.searchParams.get("action") ?? "write";
+        if (!(PAID_CLASSES as readonly string[]).includes(action)) return send(res, 400, { error: "bad_action" });
+        const cls = action as (typeof PAID_CLASSES)[number];
+        const at = url.searchParams.get("path") ?? "/";
+        if (attackfee.paid) await attackfee.paid.ensureFx();
+        const p = attackfee.currentPrice({ action: cls, path: at, ip: clientOf(attackfee, req).ip, userAgent: String(req.headers["user-agent"] ?? ""), client: "agent" });
+        return send(res, 200, priceBody({ action: cls, status: attackfee.priceStatus(), p, challenge_url: attackfee.challengeUrl(cls, at) }));
+      }
+
+      if (path === "/v1/challenge" && req.method === "GET") {
+        const action = url.searchParams.get("action") ?? "write";
+        if (!isActionClass(action) || action === "read") return send(res, 400, { error: "bad_action" });
+        const client = isAgentRequest(url.searchParams, req.headers["attackfee-client"] as string | undefined) ? "agent" : "widget";
+        if (!attackfee.allowChallenge(clientOf(attackfee, req).limit)) return send(res, 429, { error: "rate_limited" }, { "retry-after": "60" });
+        // Offers only for agent clients with paid requests on and healthy; otherwise [] (spec §8.5, §19.11).
+        // `offers=0`: the agent's work fallback (a 402's challenge_url) wants the challenge only.
+        const workOnly = url.searchParams.get("offers") === "0";
+        const input = {
+          site: url.searchParams.get("site") ?? undefined,
+          action,
+          path: url.searchParams.get("path") ?? undefined,
+          client: client as "agent" | "widget",
+          userAgent: req.headers["user-agent"],
+          ip: clientOf(attackfee, req).ip,
+          source: "challenge_endpoint" as const,
+        };
+        const { challenge, offers } = workOnly ? { challenge: await attackfee.issueChallenge(input), offers: [] } : await attackfee.issueWithOffers(input);
+        // The agent chose work after a 402 (it fetched challenge_url). challenge_minted still fires as usual.
+        if (workOnly) attackfee.metrics.workAfter402({ action, site: challenge.site, cls: challenge.bound.action });
+        return send(res, 200, { challenge, offers });
+      }
+
+      if (path === "/v1/redeem" && req.method === "POST") {
+        const body = await readBody(req);
+        if (body && body.offer_id !== undefined) {
+          if (!attackfee.paid) return send(res, 400, { error: "unsupported", detail: "paid redeem is not enabled on this issuer" });
+          // Paid pass: short (Q6), for the client's Authorization header. No cookie: agents carry it themselves.
+          const r = await attackfee.redeemPaid(body, { ip: clientOf(attackfee, req).ip });
+          return send(res, 200, { pass: r.pass, exp: r.exp, cls: r.cls, rail: r.rail });
+        }
+        if (!body || typeof body.challenge_id !== "string" || typeof body.solution !== "object" || body.solution === null) return send(res, 400, { error: "malformed" });
+        const challenge = body.challenge ?? attackfee.findIssued(body.challenge_id);
+        if (!challenge) return send(res, 401, { error: "unknown_challenge" });
+        if (challenge.id !== body.challenge_id) return send(res, 400, { error: "malformed", detail: "challenge_id mismatch" });
+        const r = await attackfee.verifySolution(challenge, body.solution, { ip: clientOf(attackfee, req).ip, client: body.client === "agent" ? "agent" : "widget" });
+        await setPassCookie(attackfee, req, res, r.pass, r.cls, r.exp);
+        return send(res, 200, { pass: r.pass, exp: r.exp, cls: r.cls, rail: r.rail });
+      }
+
+      if (path === "/v1/status" && req.method === "GET") {
+        const token = extractPass(req);
+        if (!token) return send(res, 200, { ok: false });
+        try {
+          // search is the lowest gated class, so any valid pass covers it.
+          const c = await attackfee.verifyPass(token, { action: "search", consume: false });
+          return send(res, 200, { ok: true, exp: c.exp, cls: c.cls, n: c.remaining });
+        } catch {
+          return send(res, 200, { ok: false });
+        }
+      }
+
+      // Owner API (option A, docs/settlement.md §9): a WordPress site set to "Payment server" reads its
+      // balance and sends withdrawals here, server to server, with the owner key. Off unless
+      // settlement.owner_key is set. Amounts are integer msat plus the owner's USD string.
+      if (path === "/v1/owner/balance" || path === "/v1/owner/withdraw" || path === "/v1/owner/offers" || path === "/v1/owner/redeem" || path === "/v1/owner/cashu" || path === "/v1/owner/price" || path === "/v1/owner/quote") {
+        const key = attackfee.config.settlement.owner_key;
+        if (!key || !attackfee.paid) return send(res, 404, { error: "not_found" });
+        const auth = /^Bearer\s+(\S+)$/i.exec(String(req.headers.authorization ?? ""));
+        if (!auth || !timingSafeEqual(utf8(auth[1]), utf8(key))) return send(res, 401, { error: "unauthorized" });
+        const paid = attackfee.paid;
+        if (path === "/v1/owner/balance" && req.method === "GET") {
+          const st = await paid.status();
+          const b = paid.balance();
+          return send(res, 200, { available_msat: b.msat.available_msat, available_usd: b.usd?.available ?? null, fee_bps: paid.fee_bps, paid_requests: b.paid_requests, degraded: !st.healthy, collecting: st.collecting });
+        }
+        if (path === "/v1/owner/withdraw" && req.method === "POST") {
+          const body = await readBody(req);
+          const invoice = typeof body?.invoice === "string" ? body.invoice.trim() : "";
+          const amount = StubSettler.amountOf(invoice);
+          if (amount === null) return send(res, 400, { error: "bad_invoice" });
+          // Checked against the balance before anything is sent.
+          if (amount > paid.balance().msat.available_msat) return send(res, 400, { error: "too_much" });
+          const settler = attackfee.stubSettler;
+          if (!settler) return send(res, 503, { error: "unavailable" });
+          let paidOut: { amount_msat: number; payment_hash: string };
+          try {
+            paidOut = settler.payOut(invoice);
+          } catch (e) {
+            return e instanceof TypeError ? send(res, 400, { error: "bad_invoice" }) : send(res, 503, { error: "unavailable" });
+          }
+          paid.ledger.withdraw({ site: attackfee.config.site_id, ref: paidOut.payment_hash, amount_msat: paidOut.amount_msat, at: attackfee.now() });
+          attackfee.metrics.emit("owner_withdrawal", { amount_msat: paidOut.amount_msat });
+          return send(res, 200, { ok: true, amount_msat: paidOut.amount_msat, amount_usd: paid.usd(paidOut.amount_msat) });
+        }
+        // Paid requests for a WordPress site set to Payment server (option A). The site relays offers
+        // minted here into its own 402 (with the ready-made WWW-Authenticate value, so the site holds
+        // no credential or invoice code), and forwards each paid redeem here: the settlement engine
+        // checks the proof (single use) and the payment is booked in this issuer's ledger. The site
+        // then mints its own one-use, 60-second pass. offers [] when paid requests are off or paused.
+        // Load: the site sends its visitor's coarse network as `net` ("a.b.c.0/24" or
+        // "hhhh:hhhh:hhhh::/48", exactly). Offers and quotes are priced for that network with the same
+        // policy as this issuer's own 402, and a paid redeem counts toward its velocity. A missing or
+        // malformed net is the base price, not an error (older sites send none). The network is used
+        // only as an in-memory velocity key: it is never logged, stored or echoed back.
+        // Prices for a WordPress site's manifest: amounts plus the rate, so the site derives the USD
+        // with its own copy of the same function (Settlement::offerUsd). Read-only. load_pricing says,
+        // per class, whether the offers relayed below can rise with load: true only when the site
+        // declares it sends networks (?net=1) and this issuer applies a load multiplier (velocity on).
+        if (path === "/v1/owner/price" && req.method === "GET") {
+          const table = attackfee.priceTable();
+          const fx = paid.quote();
+          const sendsNet = url.searchParams.get("net") === "1";
+          const load = attackfee.loadPricing();
+          return send(res, 200, { status: attackfee.priceStatus(), prices: table ? Object.fromEntries(Object.entries(table).map(([c, p]) => [c, { amount_msat: p!.amount_msat }])) : null, load_pricing: table ? Object.fromEntries(Object.keys(table).map((c) => [c, sendsNet && load[c as keyof typeof load] === true])) : null, fx: fx ? { usd_per_btc: fx.usd_per_btc, fetched_at: fx.fetched_at } : null });
+        }
+        if (path === "/v1/owner/offers" && req.method === "POST") {
+          const body = await readBody(req);
+          const action = body?.action;
+          if (!isActionClass(action) || action === "read") return send(res, 400, { error: "malformed" });
+          const offers = await attackfee.offersForNet(action, body?.net).catch(() => []);
+          if (!offers.length) return send(res, 200, { offers: [] });
+          const first = offers[0];
+          return send(res, 200, first.kind === "cashu" ? { offers, x_cashu: first.request } : { offers, www_authenticate: l402Challenge(first) });
+        }
+        // The price that applies now for the site's visitor network (WordPress GET /wp-json/attackfee/v1/price,
+        // basis "current"): the amount a relayed offer would carry, its load multiplier, and the rate for
+        // the site's USD. Read-only: no offer, no velocity hit, no counter, no log line.
+        if (path === "/v1/owner/quote" && req.method === "POST") {
+          const body = await readBody(req);
+          const action = body?.action;
+          if (!isActionClass(action) || action === "read") return send(res, 400, { error: "malformed" });
+          const p = attackfee.currentPriceForNet(action, body?.net);
+          const fx = paid.quote();
+          return send(res, 200, { status: attackfee.priceStatus(), action, amount_msat: p ? p.amount_msat : null, load_multiplier: p ? p.load_multiplier : null, fx: p && fx ? { usd_per_btc: fx.usd_per_btc, fetched_at: fx.fetched_at } : null });
+        }
+        if (path === "/v1/owner/redeem" && req.method === "POST") {
+          const body = await readBody(req);
+          try {
+            const r = await attackfee.redeemRelayed(body, body?.net);
+            attackfee.metrics.emit("owner_redeem", { cls: r.cls, amount_msat: r.amount_msat });
+            return send(res, 200, { ok: true, cls: r.cls, amount_msat: r.amount_msat, fee_msat: r.fee_msat, net_msat: r.net_msat });
+          } catch (e) {
+            if (e instanceof AttackfeeError && e.code === "store_unavailable") return send(res, 503, { error: "unavailable" });
+            return e instanceof AttackfeeError ? send(res, statusFor(e), { error: e.code }) : send(res, 400, { error: "malformed" });
+          }
+        }
+        if (path === "/v1/owner/cashu" && req.method === "POST") {
+          const body = await readBody(req);
+          const presented = asCashuPayment(typeof body?.token === "string" ? body.token : "");
+          const action = body?.action;
+          if (!presented || presented.length > 16384 || !isActionClass(action) || action === "read") return send(res, 400, { error: "malformed" });
+          try {
+            const r = await attackfee.bookPresentedCashu(presented, action, body?.net);
+            attackfee.metrics.emit("owner_redeem", { cls: r.cls, amount_msat: r.amount_msat });
+            return send(res, 200, { ok: true, cls: r.cls, amount_msat: r.amount_msat, fee_msat: r.fee_msat, net_msat: r.net_msat });
+          } catch (e) {
+            if (e instanceof AttackfeeError && e.code === "store_unavailable") return send(res, 503, { error: "unavailable" });
+            return e instanceof AttackfeeError ? send(res, statusFor(e), { error: e.code }) : send(res, 400, { error: "malformed" });
+          }
+        }
+        return send(res, 405, { error: "method_not_allowed" });
+      }
+
+      if (path === "/v1/siteverify" && req.method === "POST") {
+        const body = await readBody(req);
+        const secret = typeof body?.secret === "string" ? body.secret : "";
+        if (!timingSafeEqual(utf8(secret), utf8(attackfee.config.secret))) return send(res, 200, { success: false, "error-codes": ["invalid-input-secret"] });
+        const response = body?.response;
+        try {
+          let token: string;
+          if (typeof response === "string" && response.trim().startsWith("{")) {
+            const p = JSON.parse(response);
+            const ch = p.challenge ?? attackfee.findIssued(p.challenge_id);
+            if (!ch || ch.id !== p.challenge_id) throw new AttackfeeError("malformed");
+            token = (await attackfee.verifySolution(ch, p.solution ?? {}, { ip: clientOf(attackfee, req).ip })).pass;
+          } else {
+            token = String(response ?? "");
+          }
+          const action = isActionClass(body?.action) ? body.action : undefined;
+          const c = await attackfee.verifyPass(token, { action: action ?? "search" });
+          return send(res, 200, { success: true, action: c.cls, hostname: attackfee.config.hostname, challenge_ts: new Date(c.iat * 1000).toISOString() });
+        } catch (e) {
+          const code = e instanceof AttackfeeError ? e.code : "invalid-input-response";
+          return send(res, 200, { success: false, "error-codes": [code === "expired" ? "timeout-or-duplicate" : "invalid-input-response"] });
+        }
+      }
+
+      return send(res, 404, { error: "not_found" });
+    } catch (e) {
+      const status = statusFor(e);
+      if (status === 500) console.error("[attackfee] internal error:", (e as Error)?.message);
+      return send(res, status, { error: e instanceof AttackfeeError ? e.code : "internal" });
+    }
+  };
+}
+
+async function setPassCookie(attackfee: Attackfee, req: Req, res: ServerResponse, pass: string, cls: ActionClass, exp: number) {
+  // First-party only: when the widget calls the issuer from another origin, a cookie here would be
+  // a third-party cookie, so skip it; the widget then carries the pass itself (spec §10).
+  const origin = req.headers.origin;
+  if (origin && (() => { try { return new URL(origin).host !== req.headers.host; } catch { return true; } })()) return;
+  // Keep an existing valid pass for a higher class instead of overwriting it with a lower one.
+  const existing = parseCookies(req.headers.cookie as string | undefined)[PASS_COOKIE];
+  if (existing) {
+    try {
+      const c = await verifyPassToken(attackfee.config.secret, existing, { now: attackfee.now(), site: attackfee.config.site_id });
+      if (!classCovers(cls, c.cls)) return;
+    } catch {
+      /* invalid or expired: replace it */
+    }
+  }
+  const maxAge = Math.max(0, exp - attackfee.now());
+  const attrs = [`${PASS_COOKIE}=${encodeURIComponent(pass)}`, "Path=/", `Max-Age=${maxAge}`, "HttpOnly", "SameSite=Lax"];
+  if (isSecure(attackfee, req)) attrs.push("Secure");
+  res.setHeader("set-cookie", attrs.join("; "));
+}
+
+function wantsHtml(req: Req): boolean {
+  const accept = String(req.headers.accept ?? "");
+  return accept.includes("text/html") && !accept.includes("application/json");
+}
+
+export interface ProtectOptions {
+  /** Action class for this route. Defaults to the route table (unmapped POST = write). */
+  action?: ActionClass;
+  /** Text for the no-JavaScript 403 page. */
+  noJsMessage?: string;
+}
+
+/**
+ * Protect a route: requests without a valid pass for the action class are rejected (fail closed).
+ * JSON clients get 403 {error:"attackfee_required", challenge}; browsers without JS get a short HTML page.
+ */
+export function protect(attackfee: Attackfee, o: ProtectOptions = {}) {
+  return async function attackfeeMiddleware(req: Req, res: ServerResponse, next: Next) {
+    const method = (req.method ?? "GET").toUpperCase();
+    const path = new URL(req.url ?? "/", "http://x").pathname;
+    const action = o.action ?? attackfee.classify((req as any).originalUrl ? new URL((req as any).originalUrl, "http://x").pathname : path, method).cls;
+    if (action === "read") return next();
+    let body: any;
+    try {
+      body = await readBody(req);
+    } catch {
+      return send(res, 400, { error: "malformed" });
+    }
+    const token = extractPass(req, body);
+    const from = clientOf(attackfee, req);
+    const agent = isAgentRequest(new URL(req.url ?? "/", "http://x").searchParams, req.headers["attackfee-client"] as string | undefined);
+    if (!token) {
+      const paid = await cashuPassResponse(attackfee, req.headers["x-cashu"], agent, action, from.ip);
+      if (paid) return send(res, paid.status, paid.body);
+      const quoted = await quotedPassResponse(attackfee, req.headers.authorization, agent, action, from.ip);
+      if (quoted) return send(res, quoted.status, quoted.body, quoted.headers);
+      return reject(attackfee, req, res, action, o.noJsMessage, true); // first contact: absent, not rejected
+    }
+    try {
+      const claims = await attackfee.verifyPass(token, { action });
+      (req as any).attackfee = claims;
+      if (body && typeof body === "object") delete body["attackfee-pass"];
+      return next();
+    } catch (e) {
+      if (e instanceof AttackfeeError && e.code === "store_unavailable") return send(res, 503, { error: "unavailable" });
+      const paid = await cashuPassResponse(attackfee, req.headers["x-cashu"], agent, action, from.ip);
+      if (paid) return send(res, paid.status, paid.body);
+      const quoted = await quotedPassResponse(attackfee, req.headers.authorization, agent, action, from.ip);
+      if (quoted) return send(res, quoted.status, quoted.body, quoted.headers);
+      return reject(attackfee, req, res, action, o.noJsMessage, false);
+    }
+  };
+}
+
+/**
+ * Gate response for a request without a usable pass. `absent`: no pass was presented at all, which
+ * is logged as `pass_absent` (first contact), not as a rejection; invalid passes were already logged
+ * as `pass_reject` with their reason by verifyPass.
+ */
+async function reject(attackfee: Attackfee, req: Req, res: ServerResponse, action: ActionClass, noJsMessage: string | undefined, absent: boolean) {
+  const agent = isAgentRequest(new URL(req.url ?? "/", "http://x").searchParams, req.headers["attackfee-client"] as string | undefined);
+  if (!agent && wantsHtml(req)) {
+    gateLog(attackfee, action, absent, 403);
+    res.statusCode = 403;
+    res.setHeader("content-type", "text/html; charset=utf-8");
+    res.setHeader("cache-control", "no-store");
+    return res.end(`<!doctype html><meta charset="utf-8"><title>403</title><p>${noJsMessage ?? "This form needs JavaScript."}</p>`);
+  }
+  const from = clientOf(attackfee, req);
+  const r = await gateResponse(attackfee, { action, path: new URL(req.url ?? "/", "http://x").pathname, agent, userAgent: req.headers["user-agent"] as string | undefined, ip: from.ip, limit: from.limit });
+  gateLog(attackfee, action, absent, r.status);
+  return send(res, r.status, r.body, r.headers);
+}
+
+/**
+ * Agent retry with `Authorization`. Cashu is tried first. The loopback mint always accepts it.
+ * A public mint accepts it only when L402_ENABLED is 1. Null when this request is not that retry.
+ * The token and the secret are not logged.
+ */
+async function quotedPassResponse(attackfee: Attackfee, header: string | string[] | undefined, agent: boolean, action: ActionClass, ip: string | null): Promise<{ status: number; body: unknown; headers?: Record<string, string> } | null> {
+  const cashu = attackfee.config.settlement.cashu;
+  if (!agent || !cashu) return null;
+  const quoteOn = "mint" in cashu || ("mints" in cashu && l402Enabled(process.env.L402_ENABLED));
+  if (!quoteOn) return null;
+  const raw = Array.isArray(header) ? header[0] : header;
+  const parsed = parseL402Authorization(raw, "x");
+  if (!parsed || !("preimage" in parsed)) return null;
+  try {
+    const r = await attackfee.redeemQuoted({ macaroon: parsed.credential, preimage: parsed.preimage, action, ip });
+    return { status: 200, body: { pass: r.pass, exp: r.exp, cls: r.cls, rail: r.rail } };
+  } catch (e) {
+    if (e instanceof AttackfeeError && e.code === "store_unavailable") {
+      const body: { error: string; detail?: string } = { error: "unavailable" };
+      if (e.message !== e.code) body.detail = e.message;
+      return { status: 503, body, headers: quoteRetryHeaders(body.detail ?? "") };
+    }
+    return { status: statusFor(e), body: { error: e instanceof AttackfeeError ? e.code : "internal" } };
+  }
+}
+
+/**
+ * Agent retry with a token in `X-Cashu` (NUT-24). `cashuA` and `cashuB` both pay. Returns the pass
+ * response, or null when this request is not that retry. A `creqA` string is not a payment. The
+ * work challenge is unchanged when no token is presented.
+ */
+async function cashuPassResponse(attackfee: Attackfee, header: string | string[] | undefined, agent: boolean, action: ActionClass, ip: string | null): Promise<{ status: number; body: unknown } | null> {
+  if (!agent || !attackfee.config.settlement.cashu?.enabled) return null;
+  const presented = presentedCashu(header);
+  if (!presented) return null;
+  try {
+    const r = await attackfee.redeemPresentedToken(presented.token, { action, ip });
+    return { status: 200, body: { pass: r.pass, exp: r.exp, cls: r.cls, rail: r.rail } };
+  } catch (e) {
+    if (e instanceof AttackfeeError && e.code === "store_unavailable") return { status: 503, body: { error: "unavailable" } };
+    return { status: statusFor(e), body: { error: e instanceof AttackfeeError ? e.code : "internal" } };
+  }
+}
+
+function gateLog(attackfee: Attackfee, action: ActionClass, absent: boolean, status: number) {
+  if (absent) attackfee.metrics.passAbsent({ action, status });
+  if (status === 403) attackfee.metrics.turnedAway();
+}
+
+/**
+ * 402 for an agent when there is an offer to pay (settlement.md §4, Q2), with a `challenge_url` for
+ * the work fallback instead of an inline challenge: nothing is minted for the work engine unless the
+ * agent asks. Otherwise the work-only 403 with an inline challenge. Offers never appear in a 403.
+ * Both paths count against the per-IP challenge rate limit; over it, the 403 has no challenge.
+ */
+async function gateResponse(attackfee: Attackfee, o: { action: ActionClass; path: string; agent: boolean; userAgent?: string | null; ip: string | null; limit: string }): Promise<{ status: number; body: unknown; headers: Record<string, string> }> {
+  if (!attackfee.allowChallenge(o.limit)) return { status: 403, body: { error: "attackfee_required" }, headers: {} };
+  const input = { action: o.action, path: o.path, client: o.agent ? ("agent" as const) : ("widget" as const), userAgent: o.userAgent, ip: o.ip, source: "middleware" as const };
+  if (o.agent) {
+    const offers = await attackfee.offersFor(input).catch(() => []);
+    if (offers.length > 0) {
+      attackfee.metrics.offerShown({ cls: o.action, amount_msat: offers[0].amount_msat, offers: offers.length });
+      return paymentRequired(attackfee.config.site_id, o.action, o.path, offers);
+    }
+  }
+  const challenge = await attackfee.issueChallenge(input).catch(() => undefined);
+  return { status: 403, body: challenge ? { error: "attackfee_required", challenge } : { error: "attackfee_required" }, headers: {} };
+}
+
+let warnedNoPeer = false;
+/** Once per process: guardFetch was given no peer address, so it cannot tell clients apart. Names what to set, never an address or header value. */
+function warnNoPeer() {
+  if (warnedNoPeer) return;
+  warnedNoPeer = true;
+  console.warn("[attackfee] guardFetch has no peer address for this request, so X-Forwarded-For is not read, the price is the base price and every such request shares one rate-limit bucket. Pass it as info.remoteAddr (the handler's second argument) or set o.remoteAddr(request, info).");
+}
+
+/**
+ * Fetch-aware helper for Request/Response runtimes: wrap a handler so it only runs with a valid pass.
+ *   export default { fetch: guardFetch(attackfee, handler, { action: "write" }) }
+ * A Request carries no socket address, so pass the peer address as `info.remoteAddr` (second argument)
+ * or with `o.remoteAddr(request, info)`. X-Forwarded-For is read only when that address is a listed
+ * trusted proxy (ATTACKFEE_TRUSTED_PROXIES), exactly like the Node router. Without a peer address there is
+ * no client address: no network (base price) and one shared rate-limit bucket, and a one-time warning
+ * (per process) says what to set.
+ */
+export function guardFetch(
+  attackfee: Attackfee,
+  handler: (req: Request, claims: unknown) => Response | Promise<Response>,
+  o: { action?: ActionClass; remoteAddr?: (req: Request, info?: { remoteAddr?: string }) => string | null | undefined } = {},
+) {
+  return async (request: Request, info?: { remoteAddr?: string }): Promise<Response> => {
+    const url = new URL(request.url);
+    const action = o.action ?? attackfee.classify(url.pathname, request.method).cls;
+    if (action === "read") return handler(request, null);
+    const auth = request.headers.get("authorization") ?? "";
+    const m = /^(?:Attackfee|Bearer)\s+(\S+)$/i.exec(auth);
+    const token = m?.[1] ?? parseCookies(request.headers.get("cookie") ?? undefined)[PASS_COOKIE];
+    const agent = isAgentRequest(url.searchParams, request.headers.get("attackfee-client"));
+    const peerOf = () => {
+      const peer = o.remoteAddr ? o.remoteAddr(request, info) : info?.remoteAddr;
+      if (typeof peer !== "string" || peer.trim() === "") warnNoPeer();
+      return requestClient(attackfee, peer, request.headers.get("x-forwarded-for"));
+    };
+    const cashu = async () => {
+      if (!attackfee.config.settlement.cashu?.enabled) return null;
+      const header = request.headers.get("x-cashu") ?? undefined;
+      if (!presentedCashu(header)) return null;
+      return cashuPassResponse(attackfee, header, agent, action, peerOf().ip);
+    };
+    const refuse = async (absent: boolean) => {
+      const peer = o.remoteAddr ? o.remoteAddr(request, info) : info?.remoteAddr;
+      if (typeof peer !== "string" || peer.trim() === "") warnNoPeer();
+      const from = requestClient(attackfee, peer, request.headers.get("x-forwarded-for"));
+      const agent = isAgentRequest(url.searchParams, request.headers.get("attackfee-client"));
+      const r = await gateResponse(attackfee, { action, path: url.pathname, agent, userAgent: request.headers.get("user-agent"), ip: from.ip, limit: from.limit });
+      gateLog(attackfee, action, absent, r.status);
+      return Response.json(r.body, { status: r.status, headers: r.headers });
+    };
+    const quoteRetry = async () => {
+      if (!parseL402Authorization(auth, "x")) return null;
+      return quotedPassResponse(attackfee, auth, agent, action, peerOf().ip);
+    };
+    if (!token) {
+      const paid = await cashu();
+      if (paid) return Response.json(paid.body, { status: paid.status });
+      const quoted = await quoteRetry();
+      if (quoted) return Response.json(quoted.body, { status: quoted.status, headers: quoted.headers });
+      return refuse(true);
+    }
+    try {
+      const claims = await attackfee.verifyPass(token, { action });
+      return handler(request, claims);
+    } catch (e) {
+      if (e instanceof AttackfeeError && e.code === "store_unavailable") return Response.json({ error: "unavailable" }, { status: 503 });
+      const paid = await cashu();
+      if (paid) return Response.json(paid.body, { status: paid.status });
+      const quoted = await quoteRetry();
+      if (quoted) return Response.json(quoted.body, { status: quoted.status, headers: quoted.headers });
+      return refuse(false);
+    }
+  };
+}

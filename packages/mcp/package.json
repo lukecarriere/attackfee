@@ -1,0 +1,22 @@
+{
+  "name": "@attackfee/mcp",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/lukecarriere/attackfee.git", "directory": "packages/mcp" },
+  "homepage": "https://attackfee.dev/docs",
+  "bugs": { "url": "https://github.com/lukecarriere/attackfee/issues" },
+  "type": "module",
+  "description": "Local MCP server with three write tools: price a write, get a pass, verify a pass. Calls the site's own API and runs no network service of its own.",
+  "keywords": ["mcp", "model-context-protocol", "ai-agents", "http-402", "attackfee"],
+  "engines": { "node": ">=22.18" },
+  "exports": {
+    ".": {
+      "types": "./dist/types/mcp/src/server.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/types/mcp/src/server.d.ts",
+  "bin": { "attackfee-mcp": "./dist/index.js" },
+  "files": ["dist", "README.md", "LICENSE"],
+  "publishConfig": { "access": "public", "provenance": true }
+}

@@ -1,0 +1,472 @@
+// Loopback mint with a real version-01 keyset. Tokens carry the short id (first 8 bytes).
+// POST /v1/swap checks the blind signature and returns new ones. No funds leave the process.
+import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
+import { secp256k1 } from "@noble/curves/secp256k1.js";
+import { fromHex, randomBytes, toHex } from "../../protocol/src/bytes.ts";
+import { sha256 } from "../../protocol/src/hmac.ts";
+import { decodeBolt11, encodeBolt11 } from "./bolt11.ts";
+import { CASHU_UNIT, encodeTokenV4, stripMint, type CashuProof } from "./cashu.ts";
+import { deriveKeysetIdV2, proofMatches, pubkeyHex, secretY, shortKeysetId, signBlind, signSecret, splitAmount } from "./cashu-crypto.ts";
+
+const DENOMS = [1, 2, 4, 8, 16, 32, 64];
+
+export interface KeysetMint {
+  url: string;
+  /** Full version-01 keyset id (66 hex chars). */
+  keysetId: string;
+  swaps: () => number;
+  /** Full keyset ids presented on the last swap, so a test can see that short ids were expanded. */
+  lastInputIds: () => string[];
+  /** How many requests this process accepted, including refusals. */
+  requests: () => number;
+  /** Drop the spent set so a second swap of the same proofs would succeed without a local record. */
+  forgetSpent: () => void;
+  setDown: (down: boolean) => void;
+  /**
+   * Fault the next responses for `path` (`/v1/swap`, `/v1/keysets`, `/v1/keys`, `/v1/restore`,
+   * `/v1/checkstate`, `/v1/info`). `null` clears it. Modes: network, 500, empty, malformed,
+   * bad-reply (swap spends, body has no C_), uppercase (swap spends, C_ is uppercase),
+   * drop-after (swap spends, then the socket closes), pending, unspent, spent, unknown
+   * (checkstate), zero (restore returns an empty signature list), plain-422 (swap answers
+   * 422 text and does not spend). A signed reply set with
+   * `setSignedReply` replaces the 200 after the mint signs.
+   */
+  setFault: (path: string | null, mode: string | null) => void;
+  /**
+   * After a swap is signed, answer with this status and body instead of the signatures.
+   * `null` restores the normal signed reply. Cleared by `setFault(null, null)`.
+   */
+  setSignedReply: (reply: { status: number; body: string; type: string } | null) => void;
+  /** Signature the mint kept for a blinded output, if the swap was accepted. */
+  signatureFor: (B_: string) => string | undefined;
+  /** Sum of output amounts this mint has signed. */
+  signedSats: () => number;
+  /** Issue a cashuB token for `amount` sats. The keyset id in the token is the short form. */
+  token: (amount: number) => string;
+  /** How many quote invoices were created. Stays 0 unless `quotes` was set. */
+  quotePosts: () => number;
+  /** How many times POST /v1/mint/bolt11 was attempted. */
+  mintPosts: () => number;
+  /** The next `n` bolt11 mints return 500 and do not sign. */
+  failNextMints: (n: number) => void;
+  /** While set, a bolt11 mint closes the socket after it has signed instead of writing the body. */
+  setDropMint: (drop: boolean) => void;
+  /**
+   * While set, an already-issued quote's bolt11 mint returns 400 and restore returns no signatures.
+   * The first sign still happens.
+   */
+  setStuckMint: (stuck: boolean) => void;
+  /** The next bolt11 mint waits until `release`. Resolves once that call is waiting. */
+  holdNextMint: () => Promise<{ release: () => void }>;
+  /** Force the next quote invoice to this sat amount. Null restores the requested amount. */
+  setInvoiceSats: (sats: number | null) => void;
+  /**
+   * NUT-05 melt. `reserve` is the quoted fee reserve, `fee` what a payment really costs.
+   * Faults on `/v1/melt/bolt11`: refuse (400, nothing spent), unpaid (200 UNPAID, nothing spent),
+   * pending (inputs PENDING, payment unresolved), drop-after (pays, then the socket closes),
+   * no-change (pays and signs change, but the reply lists none; restore still finds it).
+   */
+  setMeltFees: (o: { reserve: number; fee: number }) => void;
+  /** Quote this sat amount on the next melt quotes instead of the invoice amount. Null restores it. */
+  setMeltQuoteAmount: (sats: number | null) => void;
+  /** Resolve a PENDING melt: PAID pays and signs change, UNPAID frees the inputs. */
+  settleMelt: (quote: string, to: "PAID" | "UNPAID") => void;
+  /** Invoices this mint has paid, in order. */
+  meltsPaid: () => string[];
+  /** How many POST /v1/melt/bolt11 calls arrived. */
+  meltPosts: () => number;
+  /** How many POST /v1/melt/quote/bolt11 calls arrived. */
+  meltQuotes: () => number;
+  close: () => Promise<void>;
+}
+
+export async function startKeysetMint(opts: { quotes?: boolean } = {}): Promise<KeysetMint> {
+  const secrets = new Map<number, Uint8Array>();
+  const pubs: Record<string, string> = {};
+  for (const amount of DENOMS) {
+    const sk = secp256k1.utils.randomSecretKey();
+    secrets.set(amount, sk);
+    pubs[String(amount)] = pubkeyHex(sk);
+  }
+  const keysetId = deriveKeysetIdV2(pubs, CASHU_UNIT, 0, null);
+  const short = shortKeysetId(keysetId);
+  const spent = new Set<string>();
+  const signed = new Map<string, { id: string; amount: number; C_: string }>();
+  let swaps = 0;
+  let requests = 0;
+  let down = false;
+  let url = "";
+  let lastIds: string[] = [];
+  const faults = new Map<string, string>();
+  let uppercaseSigs = false;
+  let signedReply: { status: number; body: string; type: string } | null = null;
+  let quotePosts = 0;
+  let mintPosts = 0;
+  let invoiceSats: number | null = null;
+  const quoteRows = new Map<string, { amount: number; preimage: string; request: string; state: "UNPAID" | "PAID" | "ISSUED"; signatures: { id: string; amount: number; C_: string }[] | null; blinded: string[] | null }>();
+  let failMints = 0;
+  let dropMint = false;
+  let stuckMint = false;
+  let hold: { promise: Promise<void>; started: () => void } | null = null;
+  let meltReserve = 2;
+  let meltFee = 1;
+  let meltPosts = 0;
+  let meltQuoteSats: number | null = null;
+  let meltQuoteCount = 0;
+  const meltsPaid: string[] = [];
+  const pendingInputs = new Set<string>();
+  const meltRows = new Map<string, { request: string; amount: number; state: "UNPAID" | "PENDING" | "PAID"; inputs: string[]; inSum: number; outputs: { id: string; B_: string }[]; change: { id: string; amount: number; C_: string }[] }>();
+
+  /** Pay a melt: spend the inputs and sign change (inputs minus amount minus fee) onto the blanks. */
+  function payMelt(id: string): void {
+    const m = meltRows.get(id)!;
+    for (const sec of m.inputs) { pendingInputs.delete(sec); spent.add(sec); }
+    let left = m.inSum - m.amount - meltFee;
+    const change: { id: string; amount: number; C_: string }[] = [];
+    for (const out of m.outputs) {
+      if (left <= 0) break;
+      const amount = [...DENOMS].reverse().find((d) => d <= left)!;
+      const sig = { id: keysetId, amount, C_: signBlind(secrets.get(amount)!, out.B_) };
+      signed.set(out.B_, sig);
+      change.push(sig);
+      left -= amount;
+    }
+    m.change = change;
+    m.state = "PAID";
+    meltsPaid.push(m.request);
+  }
+
+  function faultFor(path: string): string | null {
+    if (faults.has(path)) return faults.get(path) ?? null;
+    for (const [prefix, mode] of faults) {
+      if (path.startsWith(prefix + "/")) return mode;
+    }
+    return null;
+  }
+
+  const server: Server = createServer(async (req, res) => {
+    if (down) {
+      req.socket.destroy();
+      return;
+    }
+    requests++;
+    const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    const fault = faultFor(path);
+    if (fault === "network") { req.socket.destroy(); return; }
+    if (fault === "500") return json(res, 500, { detail: "down", code: 0 });
+    if (fault === "empty") { res.writeHead(200); res.end(); return; }
+    if (fault === "malformed") return json(res, 200, { wat: 1 });
+    try {
+      if (req.method === "GET" && path === "/v1/info") return json(res, 200, { name: "attackfee-keyset-mint", version: "test", nuts: { "4": { disabled: false } } });
+      if (req.method === "GET" && path === "/v1/keysets") return json(res, 200, { keysets: [keysetRow(keysetId)] });
+      if (req.method === "GET" && (path === "/v1/keys" || path === "/v1/keys/" + keysetId)) return json(res, 200, { keysets: [{ ...keysetRow(keysetId), keys: pubs }] });
+      if (req.method === "POST" && path === "/v1/swap") {
+        if (fault === "refuse") return json(res, 400, { detail: "refused", code: 11002 });
+        if (fault === "plain-422") {
+          await readJson(req);
+          const raw = "Failed to deserialize";
+          res.writeHead(422, { "content-type": "text/plain; charset=utf-8", "content-length": Buffer.byteLength(raw) });
+          res.end(raw);
+          return;
+        }
+        swaps++;
+        const body = await readJson(req);
+        const inputs = Array.isArray(body?.inputs) ? body.inputs : null;
+        const outputs = Array.isArray(body?.outputs) ? body.outputs : null;
+        if (!inputs || !outputs || inputs.length === 0 || inputs.length > 32 || outputs.length === 0 || outputs.length > 64) return json(res, 400, { detail: "bad request", code: 11000 });
+        let inSum = 0;
+        let bad = false;
+        let already = false;
+        const ids: string[] = [];
+        for (const input of inputs) {
+          const amount = input?.amount;
+          const id = typeof input?.id === "string" ? input.id.toLowerCase() : "";
+          const secret = typeof input?.secret === "string" ? input.secret : "";
+          const C = typeof input?.C === "string" ? input.C.toLowerCase() : "";
+          ids.push(id);
+          const sk = secrets.get(amount);
+          if (!sk || id !== keysetId || !secret || !proofMatches(sk, secret, C)) bad = true;
+          else if (spent.has(secret)) already = true;
+          else inSum += amount;
+        }
+        lastIds = ids;
+        if (bad) return json(res, 400, { detail: "unknown proof", code: 11002 });
+        if (already) return json(res, 400, { detail: "already spent", code: 11001 });
+        let outSum = 0;
+        const signatures: { id: string; amount: number; C_: string }[] = [];
+        for (const output of outputs) {
+          const amount = output?.amount;
+          const id = typeof output?.id === "string" ? output.id.toLowerCase() : "";
+          const B_ = typeof output?.B_ === "string" ? output.B_ : "";
+          const sk = secrets.get(amount);
+          if (!sk || id !== keysetId || !B_) return json(res, 400, { detail: "bad output", code: 11000 });
+          outSum += amount;
+          signatures.push({ id: keysetId, amount, C_: signBlind(sk, B_) });
+        }
+        if (inSum !== outSum) return json(res, 400, { detail: "amount", code: 11000 });
+        for (const input of inputs) spent.add(input.secret);
+        for (let i = 0; i < outputs.length; i++) signed.set(String(outputs[i].B_), signatures[i]);
+        if (signedReply) {
+          const raw = signedReply.body;
+          res.writeHead(signedReply.status, { "content-type": signedReply.type, "content-length": Buffer.byteLength(raw) });
+          res.end(raw);
+          return;
+        }
+        if (fault === "drop-after") { req.socket.destroy(); return; }
+        if (fault === "sign-then-400") return json(res, 400, { detail: "refused", code: 11000 });
+        if (fault === "http-500-json") return json(res, 500, { detail: "down", code: 11000 });
+        if (fault === "http-500-text") { res.writeHead(500, { "content-type": "text/plain" }); res.end("down"); return; }
+        if (fault === "http-502") return json(res, 502, { detail: "gateway", code: 11000 });
+        if (fault === "http-503") return json(res, 503, { detail: "unavailable", code: 11000 });
+        if (fault === "http-429") return json(res, 429, { detail: "slow", code: 11000 });
+        if (fault === "http-400-text") { res.writeHead(400, { "content-type": "text/plain" }); res.end("nope"); return; }
+        if (fault === "bad-reply") return json(res, 200, { signatures: signatures.map((s) => ({ amount: s.amount, id: s.id })) });
+        if (fault === "uppercase") {
+          uppercaseSigs = true;
+          return json(res, 200, { signatures: signatures.map((s) => ({ ...s, C_: s.C_.toUpperCase() })) });
+        }
+        return json(res, 200, { signatures });
+      }
+      if (req.method === "POST" && path === "/v1/restore") {
+        if (stuckMint) return json(res, 200, { outputs: [], signatures: [] });
+        const body = await readJson(req);
+        const outputs = Array.isArray(body?.outputs) ? body.outputs : [];
+        const found: { output: { amount?: number; id?: string; B_?: string }; sig: { id: string; amount: number; C_: string } }[] = [];
+        for (const output of outputs as { amount?: number; id?: string; B_?: string }[]) {
+          const saved = typeof output?.B_ === "string" ? signed.get(output.B_) : undefined;
+          if (!saved) continue;
+          found.push({ output, sig: { id: saved.id, amount: saved.amount, C_: uppercaseSigs ? saved.C_.toUpperCase() : saved.C_ } });
+        }
+        if (fault === "nosig") return json(res, 200, { signatures: outputs.map((output: { amount?: number; id?: string }) => ({ id: output?.id ?? "", amount: output?.amount ?? 0, C_: null })) });
+        if (fault === "partial") {
+          const signatures = outputs.map((output: { amount?: number; id?: string; B_?: string }, i: number) => {
+            const saved = typeof output?.B_ === "string" ? signed.get(output.B_) : undefined;
+            const c = saved && i === 0 ? (uppercaseSigs ? saved.C_.toUpperCase() : saved.C_) : null;
+            return saved && c ? { id: saved.id, amount: saved.amount, C_: c } : { id: output?.id ?? "", amount: output?.amount ?? 0, C_: null };
+          });
+          return json(res, 200, { signatures });
+        }
+        if (fault === "zero") return json(res, 200, { outputs: [], signatures: [] });
+        return json(res, 200, { outputs: found.map((f) => f.output), signatures: found.map((f) => f.sig) });
+      }
+      if (req.method === "POST" && path === "/v1/checkstate") {
+        const body = await readJson(req);
+        const Ys = Array.isArray(body?.Ys) ? body.Ys : [];
+        const known = new Map<string, string>();
+        for (const secret of spent) known.set(secretY(secret), "SPENT");
+        if (fault === "unknown") return json(res, 200, {});
+        const forced = fault === "pending" ? "PENDING" : fault === "unspent" ? "UNSPENT" : fault === "spent" ? "SPENT" : null;
+        for (const secret of pendingInputs) known.set(secretY(secret), "PENDING");
+        const states = Ys.map((Y: unknown) => ({ Y, state: forced ?? known.get(String(Y)) ?? "UNSPENT" }));
+        return json(res, 200, { states });
+      }
+      if (opts.quotes && req.method === "POST" && path === "/v1/mint/quote/bolt11") {
+        quotePosts++;
+        const body = await readJson(req);
+        const amount = body?.amount;
+        if (body?.unit !== CASHU_UNIT || !Number.isSafeInteger(amount) || amount <= 0 || amount > 1_000_000) return json(res, 400, { detail: "bad amount", code: 11000 });
+        const preimage = toHex(randomBytes(32));
+        const id = toHex(randomBytes(16));
+        const shown = invoiceSats ?? amount;
+        const request = encodeBolt11({ amountMsat: shown * 1000, paymentHash: toHex(await sha256(fromHex(preimage))) });
+        quoteRows.set(id, { amount, preimage, request, state: "UNPAID", signatures: null, blinded: null });
+        return json(res, 200, { quote: id, request, state: "UNPAID", expiry: Math.floor(Date.now() / 1000) + 600 });
+      }
+      const quoted = opts.quotes ? /^\/v1\/mint\/quote\/bolt11\/([0-9a-f]+)$/.exec(path) : null;
+      if (req.method === "GET" && quoted) {
+        const q = quoteRows.get(quoted[1]);
+        if (!q) return json(res, 404, { detail: "unknown", code: 404 });
+        return json(res, 200, { quote: quoted[1], request: q.request, state: q.state, expiry: Math.floor(Date.now() / 1000) + 600 });
+      }
+      if (opts.quotes && req.method === "POST" && path === "/test/pay") {
+        const body = await readJson(req);
+        const q = [...quoteRows.values()].find((row) => row.request === body?.request);
+        if (!q) return json(res, 400, { detail: "unknown", code: 11000 });
+        if (q.state === "UNPAID") q.state = "PAID";
+        return json(res, 200, { preimage: q.preimage });
+      }
+      if (opts.quotes && req.method === "POST" && path === "/v1/mint/bolt11") {
+        mintPosts++;
+        const body = await readJson(req);
+        if (hold) {
+          const waiting = hold;
+          hold = null;
+          waiting.started();
+          await waiting.promise;
+        }
+        if (failMints > 0) {
+          failMints--;
+          return json(res, 500, { detail: "down", code: 0 });
+        }
+        const q = quoteRows.get(typeof body?.quote === "string" ? body.quote : "");
+        if (!q || q.state === "UNPAID") return json(res, 400, { detail: "unpaid", code: 11000 });
+        const outputs = Array.isArray(body?.outputs) ? body.outputs : null;
+        if (q.signatures) {
+          if (stuckMint) return json(res, 400, { detail: "already issued", code: 11000 });
+          const got = (outputs ?? []).map((output: { B_?: unknown }) => typeof output?.B_ === "string" ? output.B_ : "");
+          if (!q.blinded || got.length !== q.blinded.length || got.some((b: string, i: number) => b !== q.blinded![i])) {
+            return json(res, 400, { detail: "already issued", code: 11000 });
+          }
+          if (dropMint) { req.socket.destroy(); return; }
+          return json(res, 200, { signatures: q.signatures });
+        }
+        if (!outputs || outputs.length === 0 || outputs.length > 64) return json(res, 400, { detail: "bad output", code: 11000 });
+        let outSum = 0;
+        const signatures: { id: string; amount: number; C_: string }[] = [];
+        const blinded: string[] = [];
+        for (const output of outputs) {
+          const outAmount = output?.amount;
+          const id = typeof output?.id === "string" ? output.id.toLowerCase() : "";
+          const B_ = typeof output?.B_ === "string" ? output.B_ : "";
+          const sk = secrets.get(outAmount);
+          if (!sk || id !== keysetId || !B_) return json(res, 400, { detail: "bad output", code: 11000 });
+          outSum += outAmount;
+          const C_ = signBlind(sk, B_);
+          signatures.push({ id: keysetId, amount: outAmount, C_ });
+          blinded.push(B_);
+        }
+        if (outSum !== q.amount) return json(res, 400, { detail: "amount", code: 11000 });
+        for (let i = 0; i < blinded.length; i++) signed.set(blinded[i], signatures[i]);
+        q.signatures = signatures;
+        q.blinded = blinded;
+        q.state = "ISSUED";
+        if (dropMint) { req.socket.destroy(); return; }
+        return json(res, 200, { signatures });
+      }
+      if (req.method === "POST" && path === "/v1/melt/quote/bolt11") {
+        meltQuoteCount++;
+        const body = await readJson(req);
+        let amountMsat: number | null = null;
+        try { amountMsat = decodeBolt11(String(body?.request ?? "")).amountMsat; } catch { amountMsat = null; }
+        if (body?.unit !== CASHU_UNIT || amountMsat === null || amountMsat % 1000 !== 0) return json(res, 400, { detail: "bad request", code: 11000 });
+        const id = toHex(randomBytes(16));
+        meltRows.set(id, { request: body.request, amount: amountMsat / 1000, state: "UNPAID", inputs: [], inSum: 0, outputs: [], change: [] });
+        return json(res, 200, { quote: id, amount: meltQuoteSats ?? amountMsat / 1000, fee_reserve: meltReserve, state: "UNPAID", expiry: Math.floor(Date.now() / 1000) + 600 });
+      }
+      const melted = /^\/v1\/melt\/quote\/bolt11\/([0-9a-f]+)$/.exec(path);
+      if (req.method === "GET" && melted) {
+        const m = meltRows.get(melted[1]);
+        if (!m) return json(res, 404, { detail: "unknown", code: 404 });
+        return json(res, 200, { quote: melted[1], amount: m.amount, fee_reserve: meltReserve, state: m.state, ...(m.state === "PAID" ? { change: m.change, payment_preimage: "00".repeat(32) } : {}) });
+      }
+      if (req.method === "POST" && path === "/v1/melt/bolt11") {
+        meltPosts++;
+        const body = await readJson(req);
+        if (fault === "refuse") return json(res, 400, { detail: "refused", code: 20000 });
+        const m = meltRows.get(typeof body?.quote === "string" ? body.quote : "");
+        if (!m || m.state !== "UNPAID") return json(res, 400, { detail: "quote", code: 20007 });
+        if (fault === "unpaid") return json(res, 200, { quote: body.quote, state: "UNPAID", change: [] });
+        const inputs = Array.isArray(body?.inputs) ? body.inputs : [];
+        const outputs = Array.isArray(body?.outputs) ? body.outputs : [];
+        let inSum = 0;
+        for (const input of inputs) {
+          const sk = secrets.get(input?.amount);
+          const secret = typeof input?.secret === "string" ? input.secret : "";
+          if (!sk || String(input?.id ?? "").toLowerCase() !== keysetId || !proofMatches(sk, secret, String(input?.C ?? "").toLowerCase())) return json(res, 400, { detail: "unknown proof", code: 11002 });
+          if (spent.has(secret) || pendingInputs.has(secret)) return json(res, 400, { detail: "already spent", code: 11001 });
+          inSum += input.amount;
+        }
+        if (inputs.length === 0 || inSum < m.amount + meltReserve) return json(res, 400, { detail: "amount", code: 11000 });
+        m.inputs = inputs.map((i: { secret: string }) => i.secret);
+        m.inSum = inSum;
+        m.outputs = outputs.map((o: { id?: string; B_?: string }) => ({ id: String(o?.id ?? ""), B_: String(o?.B_ ?? "") }));
+        if (fault === "pending") {
+          for (const sec of m.inputs) pendingInputs.add(sec);
+          m.state = "PENDING";
+          return json(res, 200, { quote: body.quote, state: "PENDING", change: [] });
+        }
+        payMelt(body.quote);
+        if (fault === "drop-after") { req.socket.destroy(); return; }
+        if (fault === "no-change") return json(res, 200, { quote: body.quote, state: "PAID", paid: true, payment_preimage: "00".repeat(32), change: [] });
+        return json(res, 200, { quote: body.quote, state: "PAID", paid: true, payment_preimage: "00".repeat(32), change: m.change });
+      }
+      return json(res, 404, { detail: "unknown", code: 404 });
+    } catch {
+      if (!res.headersSent) json(res, 400, { detail: "bad request", code: 11000 });
+    }
+  });
+
+  server.keepAliveTimeout = 100;
+  await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
+  url = stripMint("http://127.0.0.1:" + (server.address() as AddressInfo).port);
+
+  function issue(amount: number): string {
+    const parts = splitAmount(amount, DENOMS);
+    if (!parts) throw new Error("amount");
+    const proofs: CashuProof[] = parts.map((a) => {
+      const secret = toHex(randomBytes(32));
+      const sk = secrets.get(a)!;
+      const C = fromHex(signSecret(sk, secret));
+      return { amount: a, secret, id: short, C };
+    });
+    return encodeTokenV4({ mint: url, unit: CASHU_UNIT, proofs });
+  }
+
+  return {
+    url,
+    keysetId,
+    swaps: () => swaps,
+    lastInputIds: () => lastIds.slice(),
+    requests: () => requests,
+    forgetSpent: () => { spent.clear(); },
+    setDown: (v) => { down = v; },
+    setFault: (path, mode) => {
+      if (path === null) { faults.clear(); signedReply = null; return; }
+      if (mode === null) { faults.delete(path); return; }
+      faults.set(path, mode);
+    },
+    setSignedReply: (reply) => { signedReply = reply; },
+    signatureFor: (B_) => signed.get(B_)?.C_,
+    setMeltQuoteAmount: (sats) => { meltQuoteSats = sats; },
+    setMeltFees: (o) => { meltReserve = o.reserve; meltFee = o.fee; },
+    settleMelt: (quote, to) => {
+      const m = meltRows.get(quote);
+      if (!m || m.state !== "PENDING") return;
+      if (to === "PAID") payMelt(quote);
+      else { for (const sec of m.inputs) pendingInputs.delete(sec); m.state = "UNPAID"; }
+    },
+    meltsPaid: () => meltsPaid.slice(),
+    meltQuotes: () => meltQuoteCount,
+    meltPosts: () => meltPosts,
+    signedSats: () => [...signed.values()].reduce((n, s) => n + s.amount, 0),
+    token: issue,
+    quotePosts: () => quotePosts,
+    mintPosts: () => mintPosts,
+    failNextMints: (n) => { failMints = n; },
+    setDropMint: (drop) => { dropMint = drop; },
+    setStuckMint: (stuck) => { stuckMint = stuck; },
+    holdNextMint: () => {
+      let release!: () => void;
+      const promise = new Promise<void>((r) => { release = r; });
+      let started!: () => void;
+      const ready = new Promise<{ release: () => void }>((r) => { started = () => r({ release }); });
+      hold = { promise, started };
+      return ready;
+    },
+    setInvoiceSats: (sats) => { invoiceSats = sats; },
+    close: () => new Promise<void>((ok) => { server.closeAllConnections?.(); server.close(() => ok()); }),
+  };
+}
+
+function keysetRow(id: string) {
+  return { id, unit: CASHU_UNIT, active: true, input_fee_ppk: 0, final_expiry: null };
+}
+
+function json(res: ServerResponse, status: number, body: unknown) {
+  const raw = JSON.stringify(body);
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "content-length": Buffer.byteLength(raw) });
+  res.end(raw);
+}
+
+async function readJson(req: IncomingMessage): Promise<any> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > 1_000_000) throw new Error("too big");
+    chunks.push(chunk as Buffer);
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  return text ? JSON.parse(text) : {};
+}

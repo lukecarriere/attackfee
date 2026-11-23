@@ -1,0 +1,297 @@
+// Reads docs/copy.md, the single source for public strings and the copy lint list.
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+export const ROOT = fileURLToPath(new URL("..", import.meta.url));
+export const COPY_PATH = ROOT + "docs/copy.md";
+
+export function readCopy(path = COPY_PATH) {
+  return readFileSync(path, "utf8");
+}
+
+/** Text of the "## <title...>" section up to the next "## " heading. */
+export function section(md, titleStart) {
+  const lines = md.split("\n");
+  const i = lines.findIndex((l) => l.startsWith("## " + titleStart));
+  if (i < 0) throw new Error(`docs/copy.md: missing section "## ${titleStart}"`);
+  const out = [];
+  for (let j = i + 1; j < lines.length && !lines[j].startsWith("## "); j++) out.push(lines[j]);
+  return out.join("\n");
+}
+
+/** Lint list: whole-word, case-insensitive terms plus the percentage-as-identity rule. */
+export function lintList(md = readCopy()) {
+  const sec = section(md, "Lint list");
+  const terms = [];
+  let pctWords = [];
+  for (const raw of sec.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/percentage next to/i.test(line)) {
+      pctWords = [...line.matchAll(/"([^"]+)"/g)].map((m) => m[1]).filter((w) => !/%/.test(w));
+      continue;
+    }
+    const i = line.indexOf(":");
+    if (i < 0) continue;
+    for (const t of line.slice(i + 1).split(",")) {
+      const term = t.trim().replace(/\.$/, "").trim().toLowerCase();
+      if (term) terms.push(term);
+    }
+  }
+  if (terms.length === 0) throw new Error("docs/copy.md: lint list is empty");
+  return { terms, pctWords };
+}
+
+const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+export function lintRegexes(list = lintList()) {
+  const res = list.terms.map((t) => ({ term: t, re: new RegExp(`(?<![A-Za-z0-9_])${esc(t).replace(/\s+/g, "\\s+")}(?![A-Za-z0-9_])`, "gi") }));
+  if (list.pctWords.length) {
+    const w = list.pctWords.map(esc).join("|");
+    res.push({ term: "percentage as identity", re: new RegExp(`\\d+(?:\\.\\d+)?\\s*%\\s*(?:${w})(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?:${w})\\s*:?\\s*\\d+(?:\\.\\d+)?\\s*%`, "gi") });
+  }
+  return res;
+}
+
+// examples/agent-pay-402 code (not its README) is a payment client: it carries wire values such as the
+// mint URL, the "L402" auth scheme and the "sat" unit, like packages/settlement-ln.
+export const EXEMPT = [/^docs\/settlement\.md$/, /^docs\/settlement-vectors\.json$/, /^packages\/settlement-ln\//, /^examples\/agent-pay-402\/[^/]+\.(mjs|sh)$/];
+
+export function isExempt(relPath) {
+  return EXEMPT.some((re) => re.test(relPath.replace(/\\/g, "/")));
+}
+
+/** Exact flag tokens allowed inside fenced code blocks only (PM call, Attackfee #55). */
+export const FENCED_FLAG_TOKENS = ["--unit sats", "--network lightning", "--currency BTC"];
+
+/** Content ranges of markdown ``` fences and HTML <pre><code> blocks. */
+export function fencedCodeRanges(text) {
+  const ranges = [];
+  const mdOpen = /^```[^\n]*\r?\n/gm;
+  let m;
+  while ((m = mdOpen.exec(text))) {
+    const start = m.index + m[0].length;
+    const close = /^```[^\n]*$/gm;
+    close.lastIndex = start;
+    const c = close.exec(text);
+    const end = c ? c.index : text.length;
+    ranges.push([start, end]);
+    mdOpen.lastIndex = c ? c.index + c[0].length : text.length;
+  }
+  const htmlOpen = /<pre\b[^>]*>\s*<code\b[^>]*>/gi;
+  while ((m = htmlOpen.exec(text))) {
+    const start = m.index + m[0].length;
+    const close = /<\/code>\s*<\/pre>/gi;
+    close.lastIndex = start;
+    const c = close.exec(text);
+    const end = c ? c.index : text.length;
+    ranges.push([start, end]);
+    htmlOpen.lastIndex = c ? c.index + c[0].length : text.length;
+  }
+  return ranges;
+}
+
+function maskFencedFlagTokens(text) {
+  let out = text;
+  for (const [start, end] of fencedCodeRanges(text)) {
+    let chunk = out.slice(start, end);
+    for (const tok of FENCED_FLAG_TOKENS) chunk = chunk.split(tok).join(" ".repeat(tok.length));
+    out = out.slice(0, start) + chunk + out.slice(end);
+  }
+  return out;
+}
+
+// CAPTCHA is banned by default (lint list). Luke approved on 2026-11-18 at 10:58 PM CT
+// that it may appear on the public site in plain comparisons only: these two exact
+// sentences (and verbatim mirrors of the first with the definition paragraph). It
+// still fails in <title>, meta description, og:* and twitter:* tags, h1-h3, and FAQ questions.
+export const CAPTCHA_ALLOWED_SENTENCES = [
+  "People never pay money, and there is no CAPTCHA to solve.",
+  "There is no CAPTCHA to solve and nothing to click.",
+];
+const CAPTCHA_TERMS = new Set(["captcha", "captchas"]);
+
+/** Ranges [start, end) where captcha is never allowed, even inside an allowed sentence. */
+export function captchaRestrictedRanges(text, includeHtmlTags = true) {
+  const ranges = [];
+  const collect = (re) => {
+    const r = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
+    let m;
+    while ((m = r.exec(text))) {
+      ranges.push([m.index, m.index + m[0].length]);
+      if (m[0].length === 0) r.lastIndex++;
+    }
+  };
+  if (includeHtmlTags) {
+    collect(/<(title|h[1-3])\b[^>]*>[\s\S]*?<\/\1>/i);
+    collect(/<meta\b[^>]*\b(?:name|property)\s*=\s*["'](?:description|og:[^"']+|twitter:[^"']+)["'][^>]*>/i);
+  }
+  collect(/"@type"\s*:\s*"Question"\s*,\s*"name"\s*:\s*"(?:\\.|[^"\\])*"/);
+  return ranges;
+}
+
+function inRanges(index, ranges) {
+  return ranges.some(([a, b]) => index >= a && index < b);
+}
+
+function captchaAllowedAt(text, index) {
+  for (const s of CAPTCHA_ALLOWED_SENTENCES) {
+    let from = 0;
+    for (;;) {
+      const i = text.indexOf(s, from);
+      if (i < 0) break;
+      if (index >= i && index < i + s.length) return true;
+      from = i + s.length;
+    }
+  }
+  return false;
+}
+
+/** Returns [{ term, line, text }] hits for a public-surface file; [] for exempt paths. */
+export function lintText(relPath, text, regexes = lintRegexes()) {
+  if (isExempt(relPath)) return [];
+  const hits = [];
+  const masked = maskFencedFlagTokens(text);
+  // HTML tag ranges only on HTML surfaces. A JS comment such as "the <title> separator"
+  // would otherwise swallow the homepage strings in website/build.mjs. Built pages
+  // under website/dist are linted after `npm run build`. JSON-LD FAQ question names
+  // are still checked in every file.
+  const restricted = captchaRestrictedRanges(masked, /\.html?$/i.test(String(relPath).replace(/\\/g, "/")));
+  const lines = masked.split("\n");
+  let offset = 0;
+  for (let n = 0; n < lines.length; n++) {
+    const line = lines[n];
+    for (const { term, re } of regexes) {
+      re.lastIndex = 0;
+      if (CAPTCHA_TERMS.has(term)) {
+        let m;
+        while ((m = re.exec(line))) {
+          const abs = offset + m.index;
+          if (inRanges(abs, restricted) || !captchaAllowedAt(masked, abs)) {
+            hits.push({ term, line: n + 1, text: m[0] });
+            break;
+          }
+          if (m[0].length === 0) re.lastIndex++;
+        }
+      } else {
+        const m = re.exec(line);
+        if (m) hits.push({ term, line: n + 1, text: m[0] });
+      }
+    }
+    offset += line.length + 1;
+  }
+  return hits;
+}
+
+/** README top block from the "## README" section's code fence. */
+export function readmeTop(md = readCopy()) {
+  const m = /```\n([\s\S]*?)\n```/.exec(section(md, "README"));
+  if (!m) throw new Error("docs/copy.md: README block missing");
+  return m[1];
+}
+
+export function readmeFootnote(md = readCopy()) {
+  const m = /\*([^*]+Operators can withdraw\.)\*/.exec(section(md, "README"));
+  return m ? m[1] : null;
+}
+
+const WIDGET_KEYS = [
+  ["Working", "checking"],
+  ["Done after a visible check", "verified"],
+  ["Checkbox mode button", "verify"],
+  ["Error action", "retry"],
+  ["Error", "error"],
+  ["No JavaScript", "nojs"],
+];
+
+/** Widget strings from the "## Widget strings" table. */
+export function widgetStrings(md = readCopy()) {
+  const out = {};
+  for (const row of section(md, "Widget strings").split("\n")) {
+    const cells = row.split("|").map((c) => c.trim());
+    if (cells.length < 4 || cells[1] === "Use" || /^-+$/.test(cells[1])) continue;
+    const hit = WIDGET_KEYS.find(([prefix]) => cells[1].startsWith(prefix));
+    if (hit && !(hit[1] in out)) out[hit[1]] = cells[2];
+  }
+  for (const [, k] of WIDGET_KEYS) if (!out[k]) throw new Error(`docs/copy.md: widget string "${k}" missing`);
+  return out;
+}
+
+/** True if `s` appears verbatim in docs/copy.md (used to keep demo strings honest). */
+export function inCopy(s, md = readCopy()) {
+  return md.includes(s);
+}
+
+// ---- Vendor names (Amendment 1) ----------------------------------------------------------------
+// The work engine and settlement vendors, their hosted services, and forbidden captcha / risk-score
+// services must never appear on a public surface. The list lives in docs/adapters.md
+// ("## Vendor names (copy lint)"). Vendor names are allowed only in docs/adapters.md, package.json
+// files (dependency pins) and the bundled third-party licence notices.
+export const ADAPTERS_PATH = ROOT + "docs/adapters.md";
+export const VENDOR_ALLOWED = [/^docs\/adapters\.md$/, /(^|\/)package(-lock)?\.json$/, /(^|\/)composer\.(json|lock)$/, /(^|\/)LICENSES\.txt$/];
+
+export function isVendorAllowed(relPath) {
+  return VENDOR_ALLOWED.some((re) => re.test(relPath.replace(/\\/g, "/")));
+}
+
+/** { exact: [...], any: [...] } from the adapters doc. "Exact case:" lines match case-sensitively. */
+export function vendorList(md = readFileSync(ADAPTERS_PATH, "utf8")) {
+  const sec = section(md, "Vendor names (copy lint)");
+  const exact = [];
+  const any = [];
+  for (const raw of sec.split("\n")) {
+    const line = raw.replace(/^[-*]\s*/, "").trim();
+    const i = line.indexOf(":");
+    if (i < 0 || line.startsWith("|") || line.startsWith(">")) continue;
+    const label = line.slice(0, i).toLowerCase();
+    if (!/case/.test(label)) continue;
+    const terms = line.slice(i + 1).split(",").map((t) => t.trim().replace(/\.$/, "").trim()).filter(Boolean);
+    (/exact case/.test(label) ? exact : any).push(...terms);
+  }
+  if (exact.length + any.length === 0) throw new Error("docs/adapters.md: vendor name list is empty");
+  return { exact, any };
+}
+
+export function vendorRegexes(list = vendorList()) {
+  const mk = (t, flags) => ({ term: t, re: new RegExp(`(?<![A-Za-z0-9_])${esc(t).replace(/\s+/g, "\\s+")}(?![A-Za-z0-9_])`, flags) });
+  return [...list.exact.map((t) => mk(t, "g")), ...list.any.map((t) => mk(t, "gi"))];
+}
+
+/** Vendor-name hits for a public-surface file; [] where vendor names are allowed. */
+export function lintVendor(relPath, text, regexes = vendorRegexes()) {
+  if (isVendorAllowed(relPath)) return [];
+  const hits = [];
+  const lines = text.split("\n");
+  for (let n = 0; n < lines.length; n++) {
+    for (const { term, re } of regexes) {
+      re.lastIndex = 0;
+      const m = re.exec(lines[n]);
+      if (m) hits.push({ term: "vendor: " + term, line: n + 1, text: m[0] });
+    }
+  }
+  return hits;
+}
+
+// ---- Discovery documents (Amendment 3) --------------------------------------------------------
+// The manifest (/.well-known/attackfee.json) and the MCP tool list are for machines. Only their
+// `payment` objects may name the payment method; every other string (every `description`, the
+// tool names, the price displays) stays under the full lint list and the vendor list, and must not
+// name a payment method either.
+export const PAYMENT_METHOD_WORDS = ["ln402", "x402", "l402", "lsat", "lightning", "bolt11", "lnurl", "usdc", "bitcoin", "btc"];
+const PAYMENT_RE = new RegExp(`(?<![A-Za-z0-9_])(${PAYMENT_METHOD_WORDS.join("|")})(?![A-Za-z0-9_])`, "i");
+
+/** Hits for a discovery document: [{ path, term, text }]. Strings under a `payment` key are exempt. */
+export function lintDiscovery(doc, regexes = lintRegexes(), vendors = vendorRegexes()) {
+  const hits = [];
+  const walk = (v, path) => {
+    if (typeof v === "string") {
+      for (const h of lintText("discovery", v, regexes)) hits.push({ path, term: h.term, text: v });
+      for (const h of lintVendor("discovery", v, vendors)) hits.push({ path, term: h.term, text: v });
+      const m = PAYMENT_RE.exec(v);
+      if (m) hits.push({ path, term: "payment method outside payment: " + m[1], text: v });
+    } else if (Array.isArray(v)) v.forEach((x, i) => walk(x, `${path}[${i}]`));
+    else if (v && typeof v === "object") for (const [k, x] of Object.entries(v)) if (k !== "payment") walk(x, path ? `${path}.${k}` : k);
+  };
+  walk(doc, "");
+  return hits;
+}

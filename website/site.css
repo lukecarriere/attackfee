@@ -1,0 +1,43 @@
+/* Guides, legal pages, the demo and the 404 page. Same tokens, fonts and wordmark as home.css (brand.md "Visual direction"). */
+@font-face{font-family:"Attackfee Sans";src:url(/fonts/plex/IBMPlexSans-Regular-Latin1.woff2) format("woff2");font-weight:400;font-display:swap}
+@font-face{font-family:"Attackfee Sans";src:url(/fonts/plex/IBMPlexSans-SemiBold-Latin1.woff2) format("woff2");font-weight:600;font-display:swap}
+@font-face{font-family:"Attackfee Sans";src:url(/fonts/plex/IBMPlexSans-Bold-Latin1.woff2) format("woff2");font-weight:700;font-display:swap}
+@font-face{font-family:"Attackfee Mono";src:url(/fonts/plex/IBMPlexMono-Regular-Latin1.woff2) format("woff2");font-weight:400;font-display:swap}
+:root{--af-ink:#0F1216;--af-graphite:#1E242B;--af-steel:#5C6670;--af-paper:#F5F6F4;--af-hail:#D8E6EE;--af-signal:#FF4F1F;--af-signal-deep:#B8340C;--af-read:#2E6F95;--af-rule:#D5DBDF}
+*{box-sizing:border-box}
+/* An author display rule must not override the HTML hidden attribute. */
+[hidden]{display:none !important}
+html,body{margin:0}
+body{background:var(--af-paper);color:var(--af-ink);font:18px/1.6 "Attackfee Sans",system-ui,sans-serif;-webkit-text-size-adjust:100%}
+header{background:var(--af-ink);color:var(--af-hail)}
+.bar{max-width:760px;margin:0 auto;padding:24px 40px 20px;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px 28px}
+/* Wordmark: Plex Sans 700, tight tracking, with the Signal meter square after the final "e". */
+.mark{display:inline-flex;align-items:flex-end;gap:5px;font:700 24px/1 "Attackfee Sans",system-ui,sans-serif;letter-spacing:-.02em;color:var(--af-hail);text-decoration:none}
+.mark i{display:inline-block;width:7px;height:7px;background:var(--af-signal);margin-bottom:3px}
+nav{display:flex;flex-wrap:wrap;gap:4px 26px;font-size:15px}
+nav a{color:inherit;text-decoration:none;padding:4px 0;border-bottom:2px solid transparent;display:inline-flex;align-items:center;min-height:24px;min-width:24px}
+nav a:hover{border-bottom-color:var(--af-signal)}
+nav a[aria-current=page]{color:#fff;border-bottom-color:var(--af-signal)}
+header a:focus-visible{outline:2px solid var(--af-signal);outline-offset:3px;border-radius:2px}
+main{max-width:760px;margin:0 auto;padding:56px 40px 96px}
+/* The Signal bar above each h1 is the one accent that ties the pages to the homepage. */
+h1{font:700 48px/1.05 "Attackfee Sans",system-ui,sans-serif;letter-spacing:-.03em;color:var(--af-ink);margin:0 0 28px}
+h1:before{content:"";display:block;width:40px;height:4px;background:var(--af-signal);margin:0 0 20px}
+p{margin:0 0 20px;max-width:34em}
+main>p:first-of-type{font-size:21px;line-height:1.5}
+ul{margin:0 0 20px;padding-left:1.25rem;max-width:34em}
+li{margin:0 0 8px}
+a:focus-visible{outline:2px solid var(--af-signal-deep);outline-offset:3px;border-radius:2px}
+.site-foot{background:var(--af-ink);color:var(--af-hail);padding:24px 40px 32px;font-size:.875rem}
+.site-foot nav,.site-foot p{max-width:760px;margin:0 auto}
+.site-foot nav{gap:1.25rem}
+.site-foot p{margin-top:10px;opacity:.85}
+.site-foot a{display:inline-flex;align-items:center;min-height:24px;min-width:24px;padding:4px 0;color:inherit;text-decoration:none}
+.site-foot a:focus-visible{outline-color:var(--af-signal)}
+@media (max-width:760px){
+ .bar{padding:18px 20px 16px}
+ nav{gap:4px 16px;font-size:14px}
+ main{padding:40px 20px 72px}
+ .site-foot{padding:22px 20px 28px}
+}
+@media (max-width:480px){body{font-size:17px}h1{font-size:36px}h1:before{margin-bottom:16px}main>p:first-of-type{font-size:19px}}

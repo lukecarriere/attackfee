@@ -1,0 +1,62 @@
+# attackfee-site: the static site and the demo on attackfee.dev.
+# Production attaches only the apex as a Workers custom domain. www.attackfee.dev,
+# attackfee.com and www.attackfee.com 308 to https://attackfee.dev at the DNS layer
+# (proxied CNAME plus a Single Redirect) and must not be attached to this Worker.
+# Do not deploy from an agent; deploy happens after an independent verifier passes,
+# via scripts/deploy.sh --sha <origin/main>.
+# From a clean checkout, after `npm ci` and `npm run build`:
+#   scripts/deploy.sh --sha <commit>
+# workers_dev stays on as a fallback for now.
+name = "attackfee-site"
+main = "packages/edge-cf/dist/site.js"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = false
+
+routes = [
+  { pattern = "attackfee.dev", custom_domain = true },
+]
+
+[assets]
+directory = "website/dist"
+binding = "ASSETS"
+html_handling = "drop-trailing-slash"
+not_found_handling = "404-page"
+# Unknown site paths get website/dist/404.html with HTTP 404. /v1/* stays on the
+# worker and keeps its JSON errors. The worker runs first so a request whose host
+# is not the ATTACKFEE_SITE_URL apex can 308 to it. Production www and attackfee.com
+# redirects are at the DNS layer, not Worker custom domains. Static pages and
+# files (/, /docs/*, /learn/*, /pricing, sitemap.xml, llms.txt, llms-learn.txt, robots.txt, and the rest of
+# the built site) are then served by ASSETS and are not gated. Other paths, including
+# POST /search, stay on the worker.
+run_worker_first = true
+
+[vars]
+ATTACKFEE_SITE_URL = "https://attackfee.dev"
+SITE_ID = "site_demo"
+WRITE_PATHS = '["/demo/contact"]'
+# Cashu receive. The path is part of the mint. No new binding: proofs live in ATTACKFEE_STORE.
+# Default deploy (scripts/deploy.sh / wrangler deploy) is payments-on.
+CASHU_MINTS = '["https://mint.minibits.cash/Bitcoin"]'
+# Cashu stays the first offer. Only "1" turns L402 on.
+L402_ENABLED = "1"
+# Held-balance ceiling in msat (5,000 sats): over it, /v1/owner/balance says over_hold and one
+# cashu_hold_alert line is logged per UTC day. No automatic payout.
+CASHU_HOLD_ALERT_MSAT = "5000000"
+# SITE_SECRET is a Worker secret (local: .dev.vars, copied from .dev.vars.example). Never commit it.
+# OWNER_KEY (optional Worker secret, 32+ characters) turns on /v1/owner/balance and /v1/owner/withdraw
+# (docs/settlement.md section 19). Unset: those paths are 404. Never commit it. No NWC.
+
+# Mint-quote sweep (docs/settlement.md): every 30 minutes, at most 40 mint calls and about 24 s per run.
+# The sweep recovers paid mint quotes into the store.
+[triggers]
+crons = ["*/30 * * * *"]
+
+[[durable_objects.bindings]]
+name = "ATTACKFEE_STORE"
+class_name = "AttackfeeStoreDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AttackfeeStoreDO"]

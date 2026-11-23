@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Copy lint and tests/copy.test.ts read titles after fa12195. A depth-1 checkout
+          # hides that commit, so the title range is empty and the lint test fails.
+          fetch-depth: 0
+
+      # Squash merge #22 dropped the conservation commits. The guard test reads them.
+      - name: Fetch the Cashu receive branch
+        run: git fetch --no-tags origin cursor/edge-cashu-receive-8ea2
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Set up PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: sodium, xml, mbstring
+          coverage: none
+          tools: composer
+
+      - name: Install PHP dependencies
+        working-directory: packages/server-php
+        run: composer install --no-interaction --no-progress
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: npm audit (high or critical)
+        run: npm audit --audit-level=high
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Test
+        run: npm test
+
+      - name: Cashu conservation mutants
+        run: node scripts/mutate-cashu-conservation.mjs
+
+      - name: Cashu token mutants
+        run: node scripts/mutate-cashu-token.mjs
+
+      - name: Mint quote payment mutants
+        run: node scripts/mutate-mint-quote.mjs
+
+      - name: Cashu overlap mutants
+        run: node scripts/mutate-cashu-overlap.mjs
+
+      - name: Cashu melt mutants
+        run: node scripts/mutate-cashu-melt.mjs
+
+  # R5 payment end-to-end gate: the built Worker under wrangler dev --local, the loopback
+  # keyset mint (no real mint, no real sats), one paid write through to the owner routes.
+  # SITE_SECRET and OWNER_KEY are random per run, written to a 0600 .dev.vars by the script
+  # and never printed. Every step must pass, owner balance and withdraw included.
+  edge-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Edge end-to-end payment run
+        run: node scripts/edge-e2e.mjs
+
+  # gitleaks is the pre-merge piece the test job does not run. The rest of
+  # scripts/verify-attackfee.sh (Node 22 and Node 24, PHP, the mutant scripts, and
+  # the base proof) repeats this job plus a second Node install, so a verifier
+  # runs that command locally. See VERIFY.md.
+  verify-attackfee:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan new commits
+        env:
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash scripts/verify-attackfee.sh --only gitleaks

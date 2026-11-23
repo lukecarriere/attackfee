@@ -1,0 +1,10 @@
+# attackfee.yaml for the Express contact example. Payments are off. Set ATTACKFEE_SECRET in the environment.
+site_id: site_abc123
+secret: env:ATTACKFEE_SECRET
+issuer_public_url: http://localhost:8787
+allowed_origins: [http://localhost:8787]
+routes:
+  - { prefix: "/", class: read }
+  - { prefix: "/contact", class: write }
+settlement:
+  enabled: false
