@@ -40,5 +40,8 @@ These pages explain HTTP 402 and the paid path for automated clients. People nev
 - [Why HTTP 402 matters for automated clients](/learn/payments/why-http-402-matters-for-automated-clients)
 - [How to test an agent 402 on the demo](/learn/payments/how-to-test-an-agent-402-on-the-demo)
 - [How to request a work challenge](/learn/payments/how-to-request-a-work-challenge)
+- [What fields /v1/price returns](/learn/payments/what-fields-v1-price-returns)
+- [How to request a work-only challenge](/learn/payments/how-to-request-a-work-only-challenge)
+- [When the converted price is hidden](/learn/payments/when-the-converted-price-is-hidden)
 
 A client should also read [What is /.well-known/attackfee.json?](/learn/agents/well-known-attackfee-json) and use only methods that file lists as live.

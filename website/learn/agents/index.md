@@ -46,5 +46,6 @@ Automated clients can already read an Attackfee site. These pages explain how th
 - [A docs site open to crawlers](/learn/agents/a-docs-site-open-to-crawlers)
 - [How to read Attackfee pages as Markdown](/learn/agents/how-to-read-attackfee-pages-as-markdown)
 - [An agent checks a pass before writing](/learn/agents/an-agent-checks-a-pass-before-writing)
+- [How to solve a work challenge in Node](/learn/agents/how-to-solve-a-work-challenge-in-node)
 
 See also the [agent docs](/docs/agent) and [agent calls](/docs/ask).

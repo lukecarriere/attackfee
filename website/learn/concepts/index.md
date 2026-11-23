@@ -71,5 +71,13 @@ These pages define Attackfee, write surfaces, and passes. They also show how to 
 - [How to set trusted proxies](/learn/concepts/how-to-set-trusted-proxies)
 - [What Attackfee HTTP statuses mean](/learn/concepts/what-attackfee-http-statuses-mean)
 - [Two requests cannot share a pass use](/learn/concepts/two-requests-cannot-share-a-pass-use)
+- [How to tell if an Attackfee issuer is up](/learn/concepts/how-to-read-v1-health)
+- [What attackfee.yaml configures](/learn/concepts/what-attackfee-yaml-configures)
+- [What Attackfee error codes mean](/learn/concepts/what-attackfee-error-codes-mean)
+- [How to run the Express contact example](/learn/concepts/how-to-run-the-express-contact-example)
+- [How to set allowed origins](/learn/concepts/how-to-set-allowed-origins)
+- [How to show a visible check on a form](/learn/concepts/how-to-show-a-visible-check-on-a-form)
+- [Why self-hosted installs use a stub backend](/learn/concepts/why-self-hosted-installs-use-a-stub-backend)
+- [How to leave a search route free](/learn/concepts/how-to-leave-a-search-route-free)
 
 The [docs](/docs) are the install path. The [demo](/demo) is a contact form protected as a write.
