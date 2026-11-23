@@ -75,6 +75,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # The site build dates pages from git. A depth-1 checkout does not contain the public root.
+          fetch-depth: 0
 
       - name: Set up Node.js 22
         uses: actions/setup-node@v4
