@@ -11,7 +11,7 @@
 | Rule | Enforcer |
 | --- | --- |
 | Public copy stays on the lint list. Vendor names stay in `docs/adapters.md`, package pins, and licence notices. | `npm run lint:copy` |
-| Commit titles after `fa12195` are linted, so CI fetches full history. | `.github/workflows/ci.yml` `fetch-depth: 0` |
+| Commit titles in the checkout are linted, so CI fetches the pull request history. | `.github/workflows/ci.yml` `fetch-depth: 0` |
 | Dotted hosts outside the allow list fail. | `tests/no-hardcoded-domains.test.ts` |
 | Node packages are MIT. The plugin and the PHP library are GPL-2.0-or-later. | `tests/licence.test.ts` |
 | Page meta descriptions, including legal pages, come from `docs/copy.md`. | `tests/meta-descriptions.test.ts` |

@@ -1,0 +1,5 @@
+async function cashuPassResponse(presented: { kind: string; token?: string } | null): Promise<{ status: number; body: unknown } | null> {
+  if (!presented) return null;
+  if (presented.kind === "a") return { status: 400, body: { error: "malformed" } };
+  return { status: 200, body: { token: presented.token } };
+}

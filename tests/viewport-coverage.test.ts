@@ -1,10 +1,9 @@
 // The phone-width check has to list every page the build emits.
-// 6f65ddd^ had no viewport test while /demo already overflowed.
-// 5cd9c85 added mission and legal pages and left them out of PATHS.
+// tests/fixtures/history/demo-without-viewport has the demo page and no viewport test.
+// tests/fixtures/history/viewport-paths.test.ts.txt listed docs and left the legal pages out.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 // @ts-ignore plain JS build script
 import { PAGES, DOC_PAGES, LEGAL_PAGES, pagePath } from "../website/build.mjs";
 import { learnSourceFiles } from "../website/learn.mjs";
@@ -35,15 +34,16 @@ test("current viewport test covers every built public page", () => {
   assert.deepEqual(uncovered(src), []);
 });
 
-test("6f65ddd parent: no viewport test while the demo page existed", () => {
-  assert.throws(() => execFileSync("git", ["cat-file", "-e", "6f65ddd^:tests/viewport.test.ts"], { stdio: "pipe" }));
-  execFileSync("git", ["cat-file", "-e", "6f65ddd^:website/demo.html"], { stdio: "pipe" });
+test("before the viewport test, the demo page existed and an empty list left it uncovered", () => {
+  const dir = new URL("./fixtures/history/demo-without-viewport/", import.meta.url);
+  assert.equal(existsSync(new URL("viewport.test.ts", dir)), false);
+  assert.equal(existsSync(new URL("demo.html", dir)), true);
   assert.ok(uncovered("").includes("/demo"));
 });
 
-test("5cd9c85: viewport PATHS omitted the legal pages that the build emitted", () => {
-  const src = execFileSync("git", ["show", "5cd9c85:tests/viewport.test.ts"], { encoding: "utf8" });
-  const build = execFileSync("git", ["show", "5cd9c85:website/build.mjs"], { encoding: "utf8" });
+test("an older viewport PATHS list omitted the legal pages that the build emitted", () => {
+  const src = readFileSync(new URL("./fixtures/history/viewport-paths.test.ts.txt", import.meta.url), "utf8");
+  const build = readFileSync(new URL("./fixtures/history/legal-pages-build.mjs.txt", import.meta.url), "utf8");
   assert.match(build, /file: "mission"/);
   assert.match(build, /file: "privacy"/);
   const gaps = uncovered(src);

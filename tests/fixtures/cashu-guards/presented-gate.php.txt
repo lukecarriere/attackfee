@@ -1,0 +1,11 @@
+<?php
+// cashuA in this comment is not a call.
+function presented_response(string $action): ?array
+{
+    $raw = isset($_SERVER['HTTP_X_CASHU']) && is_string($_SERVER['HTTP_X_CASHU']) ? $_SERVER['HTTP_X_CASHU'] : '';
+    if ($raw === '') return null;
+    $p = presented_cashu($raw);
+    if ($p === null) return null;
+    if ($p['kind'] === 'a') return [400, ['error' => 'malformed'], []];
+    return [200, [], []];
+}
