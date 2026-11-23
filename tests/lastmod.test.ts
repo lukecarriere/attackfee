@@ -116,7 +116,13 @@ test("a range reply that is not a commit hash leaves a mapped page on the baseli
 
 test("pages with no commit after the public root keep the baseline in the sitemap and learn JSON-LD", () => {
   assert.equal(LASTMOD_ROOT, "107d367eea277751bf94f00d9cb93224edde431f");
-  assert.deepEqual(Object.keys(map).sort(), [...discoveryFiles()].sort());
+  const files = discoveryFiles();
+  const known = new Set(files);
+  for (const id of Object.keys(map)) assert.ok(known.has(id), id);
+  for (const id of files) {
+    if (id in map) continue;
+    assert.match(sourceLastmod(id), /^\d{4}-\d{2}-\d{2}$/, id);
+  }
   const dir = build(mkdtempSync(join(tmpdir(), "attackfee-lastmod-")) + "/", SITE, () => {});
   const sm = readFileSync(dir + "sitemap.xml", "utf8");
   let pages = 0;

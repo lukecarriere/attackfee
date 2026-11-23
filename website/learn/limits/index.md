@@ -41,5 +41,6 @@ Attackfee prices writes and leaves reads free. It does not identify the caller, 
 - [What a 429 on a challenge means](/learn/limits/what-a-429-on-a-challenge-means)
 - [Why page-view gating should stay off](/learn/limits/why-page-view-gating-should-stay-off)
 - [What Attackfee keeps, and what it does not](/learn/limits/what-attackfee-keeps)
+- [How to set the challenge rate limit](/learn/limits/how-to-set-the-challenge-rate-limit)
 
 The product privacy statement for the public site is at [/privacy](/privacy).

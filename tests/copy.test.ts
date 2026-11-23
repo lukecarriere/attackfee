@@ -262,6 +262,9 @@ function proseSentences(text: string): string[] {
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/<[^>]+>/g, " ")
     .replace(/`/g, "")
+    // A hub index is a list of page titles. Each item is its own sentence, so a
+    // later title cannot combine with an earlier one.
+    .replace(/\n\s*[-*]\s+/g, ". ")
     .replace(/\s+/g, " ")
     .trim();
   return prose.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
@@ -297,6 +300,7 @@ test("hosted-demo money copy: unscoped 'No real money moves' fails, and a hosted
   assert.deepEqual(moneyProblems(oldWp), ["No real money moves."]);
   assert.deepEqual(demoProblems("The hosted demo at example.invalid is in test mode."), ["The hosted demo at example.invalid is in test mode."]);
   assert.deepEqual(demoProblems("The hosted demo uses the stub."), ["The hosted demo uses the stub."]);
+  assert.deepEqual(demoProblems("- [Walk through the hosted demo](/learn/concepts/try-the-demo)\n- [Why self-hosted installs use a stub backend](/learn/concepts/why-self-hosted-installs-use-a-stub-backend)"), []);
   assert.deepEqual(moneyProblems("No real money moves on the self-hosted server's stub backend."), []);
   assert.deepEqual(moneyProblems("No real money moves in the WordPress plugin's test mode."), []);
   assert.deepEqual(demoProblems(HOSTED_PRICE), []);
