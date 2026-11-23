@@ -601,13 +601,83 @@ export function cliSiteBase(env) {
 
 const xml = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-/** Last content change, not build time. Omit lastmod if the source history is unavailable. */
-export function sourceLastmod(file) {
-  const paths = file === "index" ? ["website/build.mjs", "docs/copy.md"] : file === "demo" ? ["website/demo.html"] : ["website/" + file + ".md"];
-  try {
-    const date = execFileSync("git", ["log", "-1", "--format=%cs", "--", ...paths], { cwd: HERE + "..", encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-    return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : "";
-  } catch { return ""; }
+const DATE = /^\d{4}-\d{2}-\d{2}$/;
+const HASH = /^[0-9a-f]{40}$/i;
+/** Public history starts here. A page with no later commit keeps its website/lastmod.json date. */
+export const LASTMOD_ROOT = "107d367eea277751bf94f00d9cb93224edde431f";
+
+let lastmodMap;
+
+function baselineDate(file) {
+  if (!lastmodMap) lastmodMap = JSON.parse(readFileSync(HERE + "lastmod.json", "utf8"));
+  const raw = lastmodMap[file];
+  return typeof raw === "string" && DATE.test(raw) ? raw : "";
+}
+
+/** Source paths for one discovery id. Index is the later of the two. */
+function lastmodPaths(file) {
+  if (file === "index") return ["website/build.mjs", "docs/copy.md"];
+  if (file === "demo") return ["website/demo.html"];
+  return ["website/" + file + ".md"];
+}
+
+function repoGit(args) {
+  return execFileSync("git", args, { cwd: HERE + "..", encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+}
+
+function asDate(raw) {
+  const date = String(raw ?? "").trim();
+  return DATE.test(date) ? date : "";
+}
+
+function asHash(raw) {
+  const hash = String(raw ?? "").trim();
+  return HASH.test(hash) ? hash : "";
+}
+
+/**
+ * Last content change of one discovery page, not the time of this build.
+ * `git(args)` runs one git command and returns stdout, or throws when git cannot answer.
+ * The default runs at the repo root. "" when neither git nor the baseline is YYYY-MM-DD,
+ * and the sitemap then omits lastmod.
+ *
+ * index is website/build.mjs and docs/copy.md. demo is website/demo.html.
+ * Every other id is website/<id>.md. website/lastmod.json loads once: it is the pre-release
+ * baseline, not a file to edit by hand. A hash from
+ * `git log -1 --format=%H LASTMOD_ROOT..HEAD -- <paths>` means the page changed after the
+ * public root, and the date is `git log -1 --format=%cs` as before. No hash, and the id is
+ * in the map: the map date. No hash, and the id is not in the map (a new page the baseline
+ * does not list): git, as before.
+ *
+ * A shallow clone, a missing root, or no .git makes that range query throw. A boundary
+ * commit whose parent object is missing is not a content change: git diffs it against an
+ * empty tree, so every page looks new and later than the baseline. Count a git date only
+ * when that commit's parent is in the checkout. A real date later than the map wins.
+ * Otherwise a mapped id keeps the baseline. An id with no baseline still uses the git
+ * date, boundary included, because there is no other date to give. A job that builds the
+ * site fetches full history, so this boundary case is not what CI publishes.
+ */
+export function sourceLastmod(file, git = repoGit) {
+  const paths = lastmodPaths(file);
+  const mapped = baselineDate(file);
+  const run = (args) => {
+    try { return git(args); }
+    catch { return null; }
+  };
+  const gitDate = () => asDate(run(["log", "-1", "--format=%cs", "--", ...paths]));
+  const range = run(["log", "-1", "--format=%H", LASTMOD_ROOT + "..HEAD", "--", ...paths]);
+  if (range !== null) {
+    if (asHash(range)) return gitDate();
+    return mapped || gitDate();
+  }
+  const listed = run(["log", "-1", "--format=%H%n%cs", "--", ...paths]);
+  const lines = listed == null ? [] : String(listed).trim().split("\n");
+  const hash = asHash(lines[0] || "");
+  const seen = asDate(lines[1] || "");
+  const parent = hash ? run(["rev-parse", "--verify", "--quiet", hash + "^"]) : null;
+  const real = parent != null && asHash(parent) !== "";
+  if (mapped && (!real || !seen || seen <= mapped)) return mapped;
+  return seen;
 }
 
 export function sitemapXml(base, lastmod = sourceLastmod) {

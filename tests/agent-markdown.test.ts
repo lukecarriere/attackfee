@@ -128,7 +128,7 @@ test("robots.txt allows everyone and names each AI agent in an explicit allow gr
   assert.ok(readFileSync(dir + "robots.txt", "utf8").startsWith(src), "the build ships the source");
 });
 
-test("the sitemap gives each page a lastmod date from its source's last commit", () => {
+test("the sitemap gives each page a YYYY-MM-DD lastmod when the page has a date", () => {
   const sm = readFileSync(dir + "sitemap.xml", "utf8");
   const rows = [...sm.matchAll(/<url><loc>([^<]*)<\/loc>(?:<lastmod>([^<]*)<\/lastmod>)?<\/url>/g)];
   assert.equal(rows.length, discoveryFiles().length);
