@@ -102,6 +102,14 @@ test("agentRead passes a site that serves each sitemap page as Markdown and fail
   }
 });
 
+test("agentRead drops the insights beacon and the newline inserted before </body>", () => {
+  const beacon = `<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/vfixture" integrity="sha512-fixture" data-cf-beacon='{"version":"2024.11.0","token":"fixture","r":1,"spa":2}' crossorigin="anonymous"></script>`;
+  const injected = PAGE_HTML.replace("</body>", beacon + "\n</body>");
+  const stripped = stripInsightsBeacon(injected);
+  assert.equal(stripped, PAGE_HTML);
+  assert.equal(createHash("sha256").update(stripped.replace('<link rel="alternate" type="text/markdown" href="/page.md">', "")).digest("hex"), PAGE_HASH);
+});
+
 test("agentRead strips the Cloudflare insights beacon and still fails when any other script is injected", async () => {
   const beacon = `<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token":"fixture"}'></script>`;
   const withBeacon = PAGE_HTML.replace("</body>", beacon + "</body>");
@@ -278,6 +286,32 @@ test("freeChecks --expect cashu requires a 402, the configured mint, and a free 
     assert.equal(off.results.gateAgent, "FAIL");
   } finally {
     await srv.close();
+  }
+});
+
+test("agentRead fails fast when the site build is missing and no html baseline is given", async () => {
+  const src = mkdtempSync(join(tmpdir(), "live-checks-src-"));
+  const out = mkdtempSync(join(tmpdir(), "live-checks-out-"));
+  try {
+    const r = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, [join(ROOT, "scripts/live-checks.mjs"), "--only", "agentRead", "--src", src, "--out", out, "--base", "http://127.0.0.1:9"], { cwd: ROOT });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      const timer = setTimeout(() => {
+        child.kill("SIGTERM");
+        reject(new Error("live-checks CLI timed out\n" + stdout + stderr));
+      }, 5000);
+      child.on("error", (err) => { clearTimeout(timer); reject(err); });
+      child.on("close", (status) => { clearTimeout(timer); resolve({ status, stdout, stderr }); });
+    });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /build the website first or pass --html-baseline/);
+    assert.doesNotMatch(r.stdout + r.stderr, /check agentRead/);
+  } finally {
+    rmSync(src, { recursive: true, force: true });
+    rmSync(out, { recursive: true, force: true });
   }
 });
 

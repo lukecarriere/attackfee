@@ -137,7 +137,7 @@ const HELP = `Usage: scripts/live-checks.sh [--base URL] [--out dir] [--expect o
 
 Free read-only checks (the default): health, price, POST /demo/contact 403 without an agent header, the agent gate for the chosen --expect mode, a never-paying L402 header check when --expect cashu, and GET /demo/stats with exactly {accepted, rejected, reversals, reversed_sats}. Default --expect is cashu, matching production payments-on. Pass --expect off for a work-only origin.
 
-The free run ends with agentRead: every sitemap page asked for with a GPTBot user agent and with Accept: text/markdown must answer 200 text/markdown (Vary: Accept, User-Agent) with no script outside code, no site chrome and no old product name, and every text block of the page's HTML <main> must be in it. The browser HTML, minus its one Markdown alternate link, must hash to --html-baseline (JSON of path to sha256) when given, else to the --src checkout's built website/dist. A GPTBot write with the agent header must still get 402 (403 with --expect off). --only agentRead runs just that check.
+The free run ends with agentRead: every sitemap page asked for with a GPTBot user agent and with Accept: text/markdown must answer 200 text/markdown (Vary: Accept, User-Agent) with no script outside code, no site chrome and no old product name, and every text block of the page's HTML <main> must be in it. The browser HTML, minus its one Markdown alternate link, must hash to --html-baseline (JSON of path to sha256) when given, else to the --src checkout's built website/dist. If that directory is missing and no baseline is given, the check stops. A GPTBot write with the agent header must still get 402 (403 with --expect off). --only agentRead runs just that check.
 
 --spend <cap> also runs the real-ecash checks and will not spend more than <cap>. It reads proofs from --proofs or ATTACKFEE_PROOFS and the wallet module from --wallet or ATTACKFEE_WALLET. The module exports wallet(), norm, and MINT. Nothing secret is printed. A spend run's .state.json is mode 0600 and stays in the out dir.
 
@@ -187,9 +187,16 @@ async function main() {
     console.error("--only takes agentRead");
     process.exit(64);
   }
-  if (only === "") await freeChecks({ base, expect, mint: mintArg, note });
   const baselineFile = arg("--html-baseline", "");
-  await agentReadCheck({ base, expect, note, expected: baselineFile ? JSON.parse(readFileSync(baselineFile, "utf8")) : builtHtmlHashes(path.resolve(arg("--src", repo))) });
+  const srcRoot = path.resolve(arg("--src", repo));
+  let expectedHtml;
+  if (baselineFile) expectedHtml = JSON.parse(readFileSync(baselineFile, "utf8"));
+  else if (!existsSync(path.join(srcRoot, "website/dist"))) {
+    console.error("build the website first or pass --html-baseline");
+    process.exit(1);
+  } else expectedHtml = builtHtmlHashes(srcRoot);
+  if (only === "") await freeChecks({ base, expect, mint: mintArg, note });
+  await agentReadCheck({ base, expect, note, expected: expectedHtml });
   if (only !== "") {
     finish(out, base, results, lines, "");
     return;
@@ -384,10 +391,11 @@ function inspectMarkdown(res, body, blocks, isHome) {
 const mdOk = (r) => r.ok200 && r.typeOk && r.varyOk && !r.script && !r.chrome && !r.oldName && r.missingBlocks.length === 0 && r.missingFacts.length === 0;
 
 /**
- * Cloudflare Web Analytics inserts this script into HTML responses. It is not page content.
- * Only this host is removed. Any other script stays, so the HTML hash and the Markdown script check still fail.
+ * Cloudflare Web Analytics inserts this script into HTML responses, then one newline before </body>.
+ * It is not page content. Only this host is removed, together with that newline, so the bytes match
+ * the built page. Any other script stays, so the HTML hash and the Markdown script check still fail.
  */
-const INSIGHTS_BEACON = /<script\b[^>]*\bsrc=["'](?:https:)?\/\/static\.cloudflareinsights\.com\/[^"']*["'][^>]*>\s*<\/script>/gi;
+const INSIGHTS_BEACON = /<script\b[^>]*\bsrc=["'](?:https:)?\/\/static\.cloudflareinsights\.com\/[^"']*["'][^>]*>\s*<\/script>\r?\n?/gi;
 
 export function stripInsightsBeacon(html) {
   return html.replace(INSIGHTS_BEACON, "");
