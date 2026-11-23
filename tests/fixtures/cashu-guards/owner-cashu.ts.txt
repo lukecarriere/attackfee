@@ -1,0 +1,3 @@
+function ownerCashu(presented: string, action: string): void {
+  if (!presented.startsWith("cashuB") || presented.length > 16384 || action === "read") return;
+}

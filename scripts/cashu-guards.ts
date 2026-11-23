@@ -1,7 +1,8 @@
-// cashuA was refused twice (#20 bbeb17c, #21 5ef8dbd). abort() deleted proofs the mint
-// still held (#22). Each abort() is allowed when an empty restore and an all-UNSPENT
-// check already guard it. How many calls there are does not matter. lose() does not.
-// Node and TypeScript are parsed with the TypeScript compiler. PHP is not.
+// cashuA was refused, and abort() deleted proofs the mint still held. Each abort() is
+// allowed when an empty restore and an all-UNSPENT check already guard it. How many
+// calls there are does not matter. lose() does not. Known-bad samples live in
+// tests/fixtures/cashu-guards/. Node and TypeScript are parsed with the TypeScript
+// compiler. PHP is not.
 import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";

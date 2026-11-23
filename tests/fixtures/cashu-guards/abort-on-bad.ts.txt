@@ -1,0 +1,20 @@
+class Receive {
+  async complete(pending: { id: string; marks: string[] }): Promise<void> {
+    const outcome = { kind: "bad" as string };
+    const restored = { proofs: null as string[] | null, answered: true };
+    if (restored.proofs) return;
+    const state = "unspent";
+    if (outcome.kind === "bad" && state === "unspent") {
+      await (await this.useStore()).abort(pending.id);
+      throw new Error("bad_solution");
+    }
+    if (outcome.kind === "unknown" && restored.answered && state === "spent") {
+      await (await this.useStore()).lose({ id: pending.id, marks: pending.marks });
+      throw new Error("store_unavailable");
+    }
+    throw new Error("store_unavailable");
+  }
+  async useStore(): Promise<{ abort(id: string): Promise<void>; lose(row: unknown): Promise<void> }> {
+    return { async abort() {}, async lose() {} };
+  }
+}

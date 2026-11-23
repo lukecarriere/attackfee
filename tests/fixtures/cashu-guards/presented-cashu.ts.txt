@@ -1,0 +1,6 @@
+export function presentedCashu(header: string): { kind: "a" } | { kind: "b"; token: string } | null {
+  const t = header.trim();
+  if (t.startsWith("cashuB")) return { kind: "b", token: t };
+  if (t.startsWith("cashuA")) return { kind: "a" };
+  return null;
+}

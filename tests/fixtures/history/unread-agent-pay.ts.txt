@@ -1,0 +1,14 @@
+async function stats(base: string) {
+  const r = await fetch(base + "/demo/stats", { cache: "no-store" });
+  return r.status === 200 ? await r.json() : null;
+}
+
+async function writes(agent: { fetch(path: string, init: unknown): Promise<{ response: { status: number } }> }, path: string, request: (label: string) => unknown, run: string, i: number) {
+  const r = await agent.fetch(path, request(`agent write ${i} (${run})`));
+  return { status: r.response.status };
+}
+
+async function reuse(base: string, path: string) {
+  const p = await fetch(base + path, { redirect: "manual" });
+  return { status: p.status, rejected: p.status === 402 || p.status === 403 };
+}

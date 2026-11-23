@@ -1,0 +1,14 @@
+class Receive {
+  async complete(pending: { id: string }): Promise<void> {
+    const outcome = { kind: "refused" as string };
+    const state = "unspent";
+    if (outcome.kind === "refused" && state === "unspent") {
+      await (await this.useStore()).abort(pending.id);
+      throw new Error("bad_solution");
+    }
+    throw new Error("store_unavailable");
+  }
+  async useStore(): Promise<{ abort(id: string): Promise<void> }> {
+    return { async abort() {} };
+  }
+}
