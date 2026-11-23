@@ -237,11 +237,38 @@ test("commit titles are linted after TITLE_LINT_AFTER: an old title with a banne
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-  // This repo: the cutoff is fa12195 on main; the PM's brand-brief copy.md commit after it is linted.
   assert.equal(TITLE_LINT_AFTER, "fa12195d6bccf634616b7c56e1da8a5305f489c1");
-  const repo = commitTitles();
-  assert.ok(repo.some((t: any) => t.s.startsWith("copy: brand brief ruling")), "the PM's brand-brief commit is linted");
-  assert.ok(!repo.some((t: any) => t.sha.startsWith("fa12195")), "fa12195 is the cutoff and is not linted");
+});
+
+// The public history starts at 107d367, so the pre-release brand-brief commit is not here.
+// The brief's banned list is the lint list in docs/copy.md, and it holds on the public files.
+// Titles after that root are the ones this checkout must lint.
+const PUBLIC_ROOT = "107d367eea277751bf94f00d9cb93224edde431f";
+const REPO = new URL("..", import.meta.url).pathname;
+
+test("titles after the public root pass, and the brand-brief list holds in the files", () => {
+  const afterRoot = commitTitles(REPO, PUBLIC_ROOT);
+  const logged = execFileSync("git", ["-C", REPO, "log", "--format=%H %s", `${PUBLIC_ROOT}..HEAD`], { encoding: "utf8" })
+    .split("\n").filter(Boolean).map((l: string) => ({ sha: l.slice(0, 40), s: l.slice(41) }));
+  assert.ok(afterRoot.length >= 1, "at least one title after the public root");
+  assert.deepEqual(afterRoot, logged);
+  assert.ok(afterRoot.every((t: { sha: string }) => !t.sha.startsWith("107d367")), "the root commit is outside 107d367..HEAD");
+  assert.deepEqual(lintTitles(afterRoot), []);
+  const live = commitTitles();
+  for (const t of afterRoot) assert.ok(live.some((row: { sha: string }) => row.sha === t.sha), t.s);
+
+  const brief = section(md, "Lint list").split("\n").find((l: string) => l.startsWith("From the brand brief"));
+  assert.ok(brief, "docs/copy.md names the brand-brief list");
+  const briefTerms = brief.slice(brief.indexOf(":") + 1).split(",").map((t: string) => t.trim().replace(/\.$/, "").toLowerCase()).filter(Boolean);
+  assert.ok(briefTerms.includes("paywall") && briefTerms.includes("puzzle") && briefTerms.includes("captcha"));
+  const { terms } = lintList(md);
+  for (const term of briefTerms) assert.ok(terms.includes(term), term);
+  for (const file of ["README.md", "website/build.mjs", "docs/positioning.md"]) {
+    const text = readFileSync(new URL("../" + file, import.meta.url), "utf8");
+    assert.deepEqual(lintText(file, text), [], file);
+  }
+  assert.ok(lintText("README.md", "This is a paywall.").some((h: { term: string }) => h.term === "paywall"));
+  assert.ok(section(md, "Brand lines").includes("Open to read. Priced to write."));
 });
 
 // Hosted-demo payment copy. "No real money moves" stays, and only for the self-hosted stub and the
