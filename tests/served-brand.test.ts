@@ -19,6 +19,7 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 let wr: ChildProcess | undefined;
 let BASE = "";
 let log = "";
+let distScan: { files: number; hits: string[] } = { files: 0, hits: [] };
 
 test("canary: the pattern catches each old name in any case, and not the new one", () => {
   for (const s of ["To" + "ll", "TO" + "LL_SITE_URL", "less" + "spam" + "." + "dev", "Sp" + "am takes", "x-to" + "ll-store-fail"]) assert.ok(OLD_BRAND.test(s), s);
@@ -27,15 +28,16 @@ test("canary: the pattern catches each old name in any case, and not the new one
 });
 
 test("built site and served widget scripts: no old-brand names in any file or file name", () => {
-  execFileSync(process.execPath, [ROOT + "website/build.mjs"], { cwd: ROOT, stdio: "ignore" });
-  const r = scanDist();
-  assert.ok(r.files > 30, "scanned " + r.files);
-  assert.deepEqual(r.hits, [], r.hits.join("\n"));
+  // The build already ran in before(), before the worker started. Building again deletes website/dist
+  // while the worker is serving it, and /demo then stays 404.
+  assert.ok(distScan.files > 30, "scanned " + distScan.files);
+  assert.deepEqual(distScan.hits, [], distScan.hits.join("\n"));
 });
 
 before(async () => {
   execFileSync(process.execPath, [ROOT + "website/build.mjs"], { cwd: ROOT, stdio: "ignore" });
   execFileSync(process.execPath, [ROOT + "packages/edge-cf/build.mjs"], { cwd: ROOT, stdio: "ignore" });
+  distScan = scanDist();
   // Local only: a throwaway secret for this run, removed in after().
   writeFileSync(ROOT + ".dev.vars", `SITE_SECRET="${randomBytes(24).toString("hex")}"\n`, { mode: 0o600 });
   const free = await new Promise<number>((r) => { const t = createServer().listen(0, "127.0.0.1", () => { const p = (t.address() as AddressInfo).port; t.close(() => r(p)); }); });
@@ -62,14 +64,8 @@ after(() => {
 });
 
 test("site worker: every page, file, header and API response is free of old-brand names", async () => {
-  let r = await scanLive(BASE);
-  const line = (routes: { routes: string[] }, name: string) => routes.routes.find((x: string) => x.startsWith(name + " -> "));
-  // A cold local asset binding can answer 404 for /demo once, then serve the page.
-  for (let i = 0; i < 4 && line(r, "GET /demo") !== "GET /demo -> 200"; i++) {
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    r = await scanLive(BASE);
-  }
-  const status = (name: string) => line(r, name);
+  const r = await scanLive(BASE);
+  const status = (line: string) => r.routes.find((x: string) => x.startsWith(line + " -> "));
   for (const p of ["/", "/demo", "/llms.txt", "/v1/health", "/v1/price"]) assert.equal(status("GET " + p), `GET ${p} -> 200`, p);
   assert.equal(status("POST(json) /demo/contact"), "POST(json) /demo/contact -> 403");
   assert.ok(r.routes.length > 40, "requests: " + r.routes.length);

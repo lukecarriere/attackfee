@@ -171,18 +171,7 @@ export async function serveSite(req: Request, assets: Assets): Promise<Response>
     // 304 is the twin's own validator matching, so it stays the Markdown variant.
     if (res.status === 200 || res.status === 304) return retype(res, method, true);
   }
-  let fetched = await assets.fetch(req);
-  // The asset binding usually rewrites an extensionless page to its .html file.
-  // When that rewrite does not happen, the file is still the page.
-  if ((method === "GET" || method === "HEAD") && fetched.status === 404 && !path.includes(".")) {
-    const html = await assets.fetch(sub(req, path === "/" ? "/index.html" : path + ".html"));
-    if (html.status === 200 || html.status === 304) {
-      await fetched.arrayBuffer().catch(() => undefined);
-      fetched = html;
-    } else {
-      await html.arrayBuffer().catch(() => undefined);
-    }
-  }
+  const fetched = await assets.fetch(req);
   if (path === "/learn" || path.startsWith("/learn/")) return serveLearnHtml(req, fetched);
   return withVary(fetched);
 }
