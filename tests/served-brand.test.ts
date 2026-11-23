@@ -28,7 +28,7 @@ test("canary: the pattern catches each old name in any case, and not the new one
 });
 
 test("built site and served widget scripts: no old-brand names in any file or file name", () => {
-  // before() already built the site, then started the worker. Building again deletes website/dist
+  // The build already ran in before(), before the worker started. Building again deletes website/dist
   // while the worker is serving it, and /demo then stays 404.
   assert.ok(distScan.files > 30, "scanned " + distScan.files);
   assert.deepEqual(distScan.hits, [], distScan.hits.join("\n"));
