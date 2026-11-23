@@ -58,8 +58,13 @@ export function pagePath(file: string): string;
 export function discoveryFiles(): string[];
 export function cliSiteRaw(env?: NodeJS.ProcessEnv): string | undefined;
 export function build(out?: string, site?: string | null, warn?: (message: string) => void): string;
-/** Last commit date (YYYY-MM-DD) of a page's source, or "" without git history. */
-export function sourceLastmod(file: string): string;
+/** Public history starts here. A page with no later commit keeps its website/lastmod.json date. */
+export const LASTMOD_ROOT: string;
+/**
+ * Last content change (YYYY-MM-DD) of one discovery page, or "" when neither git nor the baseline has a date.
+ * `git` runs one git argv and returns stdout, or throws. Omitted, git runs at the repo root.
+ */
+export function sourceLastmod(file: string, git?: (args: string[]) => string): string;
 export function sitemapXml(base: string, lastmod?: (file: string) => string): string;
 /** RFC 9116 Expires for /.well-known/security.txt. */
 export const SECURITY_TXT_EXPIRES: string;

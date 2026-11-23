@@ -2,6 +2,7 @@
 
 - Run `npm test` before opening a change. Node 22.18 or newer. For the PHP checks, PHP 8.1 or newer with the sodium, xml, and mbstring extensions, then `composer install` in `packages/server-php`. Browser tests need Playwright Chromium: `npx playwright install --with-deps chromium`.
 - Public wording follows `docs/copy.md`. The copy lint keeps vendor names off public surfaces.
+- Edit a page and its sitemap date updates from git. `website/lastmod.json` is only the pre-release baseline, so do not hand-edit it.
 - `docs/copy.md`, `docs/adapters.md`, `docs/positioning.md`, and `docs/catalogs.md` are contributor docs. They are not pages for the public site.
 - Tests and local runs use the stub backend and local test mints only, never real money or a live mint.
 - Do not deploy, publish, change DNS, or change repository visibility.
