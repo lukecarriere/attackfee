@@ -1,14 +1,18 @@
 // Agent view under `wrangler dev --local`: the site worker answers every sitemap page as Markdown to an
 // AI agent user agent or an Accept: text/markdown request, keeps the HTML bytes for a browser, and
 // leaves writes, the gate and the API exactly as they were. No deploy, no route, no zone, no real money.
+// Mint calls go to a loopback stub. The allowlist stays the configured mint URL: a loopback URL in
+// CASHU_MINTS is not fetched by the receive engine. ATTACKFEE_TEST_HOOKS lets CASHU_FETCH_PROXY send
+// those calls to the stub, so a slow public mint cannot turn an agent write into the work fallback.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
 import { discoveryFiles, pagePath } from "../website/build.mjs";
 import { twinPath, stripAlternate, outsideCode } from "../website/agent-text.mjs";
@@ -22,26 +26,138 @@ const BROWSER_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/
 const htmlFile = (file: string) => (file === "index" ? "index.html" : file === "demo" ? "demo.html" : file + ".html");
 
 let wr: ChildProcess;
+let mintProc: ChildProcess | undefined;
+let mintUrl = "";
 let BASE = "";
 let log = "";
+
+// Own process: the tests call curl with spawnSync, which blocks this event loop. An in-process
+// stub could not answer, and the worker's mint fetch would wait forever.
+const MINT_STUB = `
+import { createServer } from "node:http";
+let mode = "ok";
+function writeJson(res, status, body) {
+  const raw = JSON.stringify(body);
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(raw), "connection": "close" });
+  res.end(raw);
+}
+function readBody(req) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", () => resolve(""));
+  });
+}
+const server = createServer(async (req, res) => {
+  const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+  if (req.method === "POST" && path === "/__mode") {
+    const text = (await readBody(req)).trim();
+    mode = text === "down" ? "down" : "ok";
+    return writeJson(res, 200, { mode });
+  }
+  req.resume();
+  if (mode === "down") return writeJson(res, 500, { detail: "down" });
+  if (req.method === "GET" && path === "/v1/info") return writeJson(res, 200, { name: "attackfee-test-mint", version: "test" });
+  writeJson(res, 404, { detail: "unused" });
+});
+server.listen(0, "127.0.0.1", () => {
+  process.stdout.write("http://127.0.0.1:" + server.address().port + "\\n");
+});
+`;
+
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const t = createServer();
+    t.once("error", reject);
+    t.listen(0, "127.0.0.1", () => {
+      const port = (t.address() as AddressInfo).port;
+      t.close(() => resolve(port));
+    });
+  });
+}
+
+/** Loopback stand-in for the mint. Info is enough for an offer; anything else is a fast refusal so a quote call cannot wait out the mint timeout. */
+function startMintStub(): Promise<string> {
+  const child = spawn(process.execPath, ["--input-type=module", "-e", MINT_STUB], { stdio: ["ignore", "pipe", "pipe"] });
+  mintProc = child;
+  let err = "";
+  child.stderr!.on("data", (c: Buffer) => { err += c.toString(); });
+  return new Promise((resolve, reject) => {
+    let out = "";
+    const t = setTimeout(() => reject(new Error("mint stub did not listen\n" + err)), 5_000);
+    child.once("exit", (code) => { clearTimeout(t); reject(new Error("mint stub exited " + code + "\n" + err)); });
+    child.stdout!.on("data", (c: Buffer) => {
+      out += c.toString();
+      const line = out.split("\n").find((l) => l.startsWith("http://"));
+      if (!line) return;
+      clearTimeout(t);
+      child.removeAllListeners("exit");
+      resolve(line.trim());
+    });
+  });
+}
+
+/** The fail-soft case. The switch is not a mint route the worker calls. */
+async function setMintMode(mode: "ok" | "down") {
+  const res = await fetch(mintUrl + "/__mode", { method: "POST", body: mode, signal: AbortSignal.timeout(2_000) });
+  const text = await res.text();
+  if (!res.ok) throw new Error("mint mode " + res.status + " " + text);
+}
+
+function childPids(parent: number): number[] {
+  const out: number[] = [];
+  let names: string[];
+  try { names = readdirSync("/proc"); } catch { return out; }
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    let status = "";
+    try { status = readFileSync("/proc/" + name + "/status", "utf8"); } catch { continue; }
+    const ppid = /^PPid:\s+(\d+)/m.exec(status);
+    if (ppid && Number(ppid[1]) === parent) out.push(Number(name));
+  }
+  return out;
+}
+
+function pidsUnder(root: number): number[] {
+  const out: number[] = [];
+  const stack = childPids(root);
+  while (stack.length) {
+    const pid = stack.pop()!;
+    if (pid <= 1 || pid === process.pid) continue;
+    out.push(pid);
+    stack.push(...childPids(pid));
+  }
+  return out;
+}
+
+function signalPid(pid: number, sig: NodeJS.Signals) {
+  if (pid <= 1 || pid === process.pid) return;
+  try { process.kill(pid, sig); } catch { /* already gone */ }
+}
+
+/** Stop the wrangler process this file spawned, and the children it spawned. Nothing else. */
+async function stopStarted(child: ChildProcess | undefined) {
+  const pid = child?.pid;
+  if (!pid) return;
+  const tree = () => [pid, ...pidsUnder(pid)];
+  for (const p of tree()) signalPid(p, "SIGTERM");
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline && tree().some((p) => { try { process.kill(p, 0); return true; } catch { return false; } })) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  for (const p of tree()) signalPid(p, "SIGKILL");
+}
 
 before(async () => {
   execFileSync(process.execPath, [ROOT + "website/build.mjs"], { cwd: ROOT });
   execFileSync(process.execPath, [ROOT + "packages/edge-cf/build.mjs"], { cwd: ROOT });
-  writeFileSync(ROOT + ".dev.vars", `SITE_SECRET="${SECRET}"\nCASHU_MINTS=["https://mint.minibits.cash/Bitcoin"]\nL402_ENABLED=1\n`, { mode: 0o600 });
-  // Stay inside the shared engineering port range, choosing only a port we can bind now.
-  let free = 0;
-  for (let p = 8800; p <= 8809; p++) {
-    const available = await new Promise<boolean>((resolve) => {
-      const t = createServer();
-      t.once("error", () => resolve(false));
-      t.listen(p, "127.0.0.1", () => t.close(() => resolve(true)));
-    });
-    if (available) { free = p; break; }
-  }
-  if (!free) throw new Error("no free local test port in 8800-8809");
+  mintUrl = await startMintStub();
+  writeFileSync(ROOT + ".dev.vars", `SITE_SECRET="${SECRET}"\nATTACKFEE_TEST_HOOKS=1\nCASHU_MINTS=["https://mint.minibits.cash/Bitcoin"]\nCASHU_FETCH_PROXY="${mintUrl}"\nL402_ENABLED=1\n`, { mode: 0o600 });
+  const free = await freePort();
+  const inspector = await freePort();
   const persist = mkdtempSync(join(tmpdir(), "attackfee-agent-view-"));
-  wr = spawn(ROOT + "node_modules/.bin/wrangler", ["dev", "--local", "--ip", "127.0.0.1", "--port", String(free), "--persist-to", persist, "--show-interactive-dev-session=false"], {
+  wr = spawn(ROOT + "node_modules/.bin/wrangler", ["dev", "--local", "--ip", "127.0.0.1", "--port", String(free), "--inspector-port", String(inspector), "--persist-to", persist, "--show-interactive-dev-session=false"], {
     cwd: ROOT,
     env: { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "1" },
     stdio: ["ignore", "pipe", "pipe"],
@@ -57,8 +173,9 @@ before(async () => {
   BASE = `http://127.0.0.1:${free}`;
 });
 
-after(() => {
-  wr?.kill("SIGTERM");
+after(async () => {
+  await stopStarted(wr);
+  await stopStarted(mintProc);
   rmSync(ROOT + ".dev.vars", { force: true });
 });
 
@@ -71,6 +188,7 @@ function curl(urlPath: string, args: string[] = []): { status: number; body: str
   return { status: Number(/HTTP\/\d(?:\.\d)? (\d+)/.exec(headers)?.[1] ?? 0), body, headers };
 }
 const header = (h: string, name: string) => new RegExp(`^${name}:\\s*(.+?)\\s*$`, "im").exec(h)?.[1] ?? null;
+const shown = (who: string, r: { status: number; body: string }) => `${who}: status ${r.status} body ${r.body}`;
 
 test("every sitemap page: an AI agent or Accept: text/markdown gets the Markdown twin at the same URL", () => {
   for (const file of discoveryFiles()) {
@@ -114,16 +232,17 @@ test("writes are unchanged for AI agents: 402 with an agent header, 403 without 
   for (const ua of [GPTBOT, CLAUDEBOT]) {
     for (const accept of [[], ["-H", "accept: text/markdown"]]) {
       const agent = curl("/demo/contact", [...base, ...accept, "-A", ua, "-H", "attackfee-client: agent"]);
-      assert.equal(agent.status, 402, ua);
-      assert.equal(JSON.parse(agent.body).error, "payment_required", ua);
-      assert.doesNotMatch(header(agent.headers, "content-type") ?? "", /markdown/);
+      const who = `attackfee-client: agent ${ua}`;
+      assert.equal(agent.status, 402, shown(who, agent));
+      assert.equal(JSON.parse(agent.body).error, "payment_required", shown(who, agent));
+      assert.doesNotMatch(header(agent.headers, "content-type") ?? "", /markdown/, shown(who, agent));
     }
     const plain = curl("/demo/contact", [...base, "-A", ua]);
-    assert.equal(plain.status, 403, ua);
-    assert.equal(JSON.parse(plain.body).error, "attackfee_required", ua);
+    assert.equal(plain.status, 403, shown("no agent header " + ua, plain));
+    assert.equal(JSON.parse(plain.body).error, "attackfee_required", shown("no agent header " + ua, plain));
   }
   const chrome = curl("/demo/contact", [...base, "-A", CHROME, "-H", "attackfee-client: agent"]);
-  assert.equal(chrome.status, 402, "the same 402 as a browser user agent with the agent header");
+  assert.equal(chrome.status, 402, shown("browser user agent with the agent header", chrome));
 });
 
 test("the API and discovery files ignore the agent view", () => {
@@ -157,4 +276,20 @@ test("the agentRead live-check passes against the local site worker and built HT
   assert.equal(result.code, 0, result.output);
   assert.match(result.output, /check agentRead: PASS/);
   console.log(result.output);
+});
+
+test("a mint that answers 500 fails soft: an agent write is 403 attackfee_required, never Markdown", async () => {
+  await setMintMode("down");
+  try {
+    const base = ["-X", "POST", "-H", "content-type: application/json", "-d", "{\"message\":\"hi\"}", "-A", GPTBOT, "-H", "attackfee-client: agent"];
+    for (const accept of [["-H", "accept: application/json"], ["-H", "accept: text/markdown"]]) {
+      const agent = curl("/demo/contact", [...base, ...accept]);
+      const who = "attackfee-client: agent, mint info 500";
+      assert.equal(agent.status, 403, shown(who, agent));
+      assert.equal(JSON.parse(agent.body).error, "attackfee_required", shown(who, agent));
+      assert.doesNotMatch(header(agent.headers, "content-type") ?? "", /markdown/, shown(who, agent));
+    }
+  } finally {
+    await setMintMode("ok");
+  }
 });
