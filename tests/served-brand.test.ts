@@ -62,8 +62,14 @@ after(() => {
 });
 
 test("site worker: every page, file, header and API response is free of old-brand names", async () => {
-  const r = await scanLive(BASE);
-  const status = (line: string) => r.routes.find((x: string) => x.startsWith(line + " -> "));
+  let r = await scanLive(BASE);
+  const line = (routes: { routes: string[] }, name: string) => routes.routes.find((x: string) => x.startsWith(name + " -> "));
+  // A cold local asset binding can answer 404 for /demo once, then serve the page.
+  for (let i = 0; i < 4 && line(r, "GET /demo") !== "GET /demo -> 200"; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    r = await scanLive(BASE);
+  }
+  const status = (name: string) => line(r, name);
   for (const p of ["/", "/demo", "/llms.txt", "/v1/health", "/v1/price"]) assert.equal(status("GET " + p), `GET ${p} -> 200`, p);
   assert.equal(status("POST(json) /demo/contact"), "POST(json) /demo/contact -> 403");
   assert.ok(r.routes.length > 40, "requests: " + r.routes.length);

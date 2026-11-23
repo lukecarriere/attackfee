@@ -144,6 +144,17 @@ test("serveSite: .md URLs are served as Markdown, /.md is the home twin, and fil
   assert.equal(missingMd.status, 404);
 });
 
+test("serveSite: an extensionless page is read from its html file when the binding does not rewrite it", async () => {
+  const a = assets({ "/demo.html": ["text/html", "<!doctype html><h1>Demo</h1>"], "/demo.md": ["text/markdown", "# Demo\n"] });
+  const human = await serveSite(req("/demo", { "user-agent": CHROME, accept: BROWSER_ACCEPT }), a);
+  assert.equal(human.status, 200);
+  assert.equal(human.headers.get("content-type"), "text/html");
+  assert.equal(await human.text(), "<!doctype html><h1>Demo</h1>");
+  assert.ok(a.seen.includes("GET /demo.html"));
+  const missing = await serveSite(req("/gone", { "user-agent": CHROME, accept: BROWSER_ACCEPT }), a);
+  assert.equal(missing.status, 404);
+});
+
 test("serveSite: a POST is passed through untouched, even from an AI agent asking for Markdown", async () => {
   const a = assets(FILES);
   const r = await serveSite(req("/", { "user-agent": "GPTBot/1.2", accept: "text/markdown" }, "POST"), a);
