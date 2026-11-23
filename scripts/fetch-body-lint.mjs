@@ -1,6 +1,5 @@
 // PHP's built-in server sends Connection: close. An unread fetch body pauses undici, and
-// Parser.finish then throws assert(!this.paused). That broke agent-pay (f935537) and the
-// WordPress counter test (e6fb4a6). Reading .status or .ok does not read the body.
+// Parser.finish then throws assert(!this.paused). Reading .status or .ok does not read the body.
 // json, text, arrayBuffer, blob, and formData do.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";

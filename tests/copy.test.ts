@@ -5,7 +5,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 // @ts-ignore plain JS helper
 import { lintList, lintRegexes, lintText, readmeTop, widgetStrings, readCopy, isExempt, section } from "../scripts/copy-lib.mjs";
 // @ts-ignore plain JS helper
-import { runLint, commitTitles, lintTitles, TITLE_LINT_AFTER } from "../scripts/copy-lint.mjs";
+import { runLint, commitTitles, lintTitles } from "../scripts/copy-lint.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -216,7 +216,7 @@ test("the widget dist names no captcha or risk-score service and loads nothing f
   assert.doesNotMatch(js, /https?:\/\/(?!www\.w3\.org)/);
 });
 
-test("commit titles are linted after TITLE_LINT_AFTER: an old title with a banned word is skipped, a new one still fails", () => {
+test("commit titles are linted after a cutoff: an old title with a banned word is skipped, a new one still fails", () => {
   const dir = mkdtempSync(join(tmpdir(), "attackfee-title-lint-"));
   try {
     const git = (...a: string[]) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@localhost", "-c", "commit.gpgsign=false", ...a], { encoding: "utf8" }).trim();
@@ -237,11 +237,9 @@ test("commit titles are linted after TITLE_LINT_AFTER: an old title with a banne
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-  // This repo: the cutoff is fa12195 on main; the PM's brand-brief copy.md commit after it is linted.
-  assert.equal(TITLE_LINT_AFTER, "fa12195d6bccf634616b7c56e1da8a5305f489c1");
   const repo = commitTitles();
-  assert.ok(repo.some((t: any) => t.s.startsWith("copy: brand brief ruling")), "the PM's brand-brief commit is linted");
-  assert.ok(!repo.some((t: any) => t.sha.startsWith("fa12195")), "fa12195 is the cutoff and is not linted");
+  assert.ok(repo.length >= 1, "this checkout's titles are linted");
+  assert.equal(lintTitles(repo).length, 0, JSON.stringify(repo));
 });
 
 // Hosted-demo payment copy. "No real money moves" stays, and only for the self-hosted stub and the

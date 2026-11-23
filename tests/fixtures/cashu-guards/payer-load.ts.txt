@@ -1,0 +1,4 @@
+function load(source: { token?: string; proofs?: unknown[]; mint?: string }): void {
+  if (typeof source.token === "string" && source.token.startsWith("cashuB")) return;
+  if (!source.proofs || source.proofs.length === 0 || typeof source.mint !== "string") throw new Error("no proofs");
+}

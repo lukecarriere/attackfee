@@ -4,8 +4,7 @@
 // work only) and the WordPress plugin (tests/php/run-discovery.php, paid and work only).
 // tests/site-url.test.ts compares them with tests/fixtures/discovery-golden.json.
 //
-// The golden file was originally captured from 23108ec and later updated in place when
-// discovery copy changed. To regenerate from a tree:
+// The golden file is maintained in the repo. To regenerate from a tree:
 //   node tests/discovery-docs.ts <tree> tests/fixtures/discovery-golden.json
 import { request, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -115,9 +114,9 @@ export async function allDocsUnset(root: string): Promise<Docs> {
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [root, outFile] = process.argv.slice(2);
   if (!root || !outFile) throw new Error("usage: node tests/discovery-docs.ts <tree> <out.json>");
-  const base = execFileSync("git", ["-C", HERE, "rev-parse", "23108ec"], { encoding: "utf8" }).trim();
+  const base = execFileSync("git", ["-C", HERE, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
   const docs = await allDocsUnset(root);
-  writeFileSync(outFile, JSON.stringify({ base_commit: base, how: "Golden discovery documents. Originally captured from 23108ec. Regenerate with: node tests/discovery-docs.ts <tree> tests/fixtures/discovery-golden.json", docs }, null, 2) + "\n");
+  writeFileSync(outFile, JSON.stringify({ base_commit: base, how: "Golden discovery documents. Regenerate with: node tests/discovery-docs.ts <tree> tests/fixtures/discovery-golden.json", docs }, null, 2) + "\n");
   console.log(`wrote ${Object.keys(docs).length} documents from ${root}`);
   process.exit(0);
 }

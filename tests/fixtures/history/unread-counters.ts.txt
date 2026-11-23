@@ -1,0 +1,7 @@
+async function up(url: string) {
+  try { return (await fetch(url, { signal: AbortSignal.timeout(2000) })).ok; } catch { return false; }
+}
+
+async function listed(WP: string, p: string) {
+  assert.equal((await fetch(WP + p)).status, 200);
+}

@@ -1,0 +1,5 @@
+async function redeemPaid(body: { kind?: string; token?: string; credential?: string }): Promise<void> {
+  if (body.kind === "cashu") {
+    if (typeof body.token !== "string" || typeof body.credential !== "string" || !body.token.startsWith("cashuB")) throw new Error("malformed");
+  }
+}
